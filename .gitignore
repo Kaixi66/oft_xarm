@@ -1,0 +1,19 @@
+# Local generated data and checkpoints
+rlds_data/
+rlds_data_setting1/
+rlds_data_setting2/
+openvla_oft_runs/
+.cache/
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs and temporary files
+*.log
+nohup.out
+.DS_Store
+
+# Optional local copies from external repos
+openpi_xarm_git-main/
