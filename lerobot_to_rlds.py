@@ -114,6 +114,32 @@ def split_episodes(
     return train, val
 
 
+def filter_noop_rows(
+    rows: list[dict[str, Any]],
+    *,
+    pos_thresh: float,
+    rot_thresh: float,
+) -> list[dict[str, Any]]:
+    """Drop no-op frames: negligible translation and rotation with no gripper
+    change relative to the previous frame. Mirrors the `remove_zero` filtering
+    used for the pi0 checkpoints; without it ~30% of the frames are idle and
+    the policy learns to stand still."""
+    kept = []
+    prev_gripper = float(np.asarray(rows[0]["actions"], dtype=np.float32)[6])
+    for row in rows:
+        action = np.asarray(row["actions"], dtype=np.float32)
+        gripper = float(action[6])
+        gripper_changed = abs(gripper - prev_gripper) > 1e-6
+        moving = (
+            float(np.linalg.norm(action[:3])) >= pos_thresh
+            or float(np.linalg.norm(action[3:6])) >= rot_thresh
+        )
+        if moving or gripper_changed:
+            kept.append(row)
+        prev_gripper = gripper
+    return kept
+
+
 def image_record_to_array(record: dict[str, Any], dataset_root: Path, image_module: Any) -> np.ndarray:
     if record.get("bytes"):
         image = image_module.open(BytesIO(record["bytes"]))
@@ -141,6 +167,7 @@ def episode_to_example(
     image_module: Any,
     task_map: dict[int, str],
     max_frames: int | None,
+    noop_thresholds: tuple[float, float] | None,
 ) -> dict[str, Any]:
     rows = pq.read_table(
         parquet_path,
@@ -150,6 +177,15 @@ def episode_to_example(
         rows = rows[:max_frames]
     if not rows:
         raise ValueError(f"Empty episode: {parquet_path}")
+
+    if noop_thresholds is not None:
+        pos_thresh, rot_thresh = noop_thresholds
+        kept = filter_noop_rows(rows, pos_thresh=pos_thresh, rot_thresh=rot_thresh)
+        print(f"[filter] {dataset_root.name}/{parquet_path.name}: kept {len(kept)}/{len(rows)} frames")
+        if len(kept) >= 2:
+            rows = kept
+        else:
+            print(f"[filter] {parquet_path.name}: too few frames left, keeping episode unfiltered")
 
     steps = []
     for frame_idx, row in enumerate(rows):
@@ -195,6 +231,7 @@ def make_builder_class(
     val_episodes: list[tuple[Path, Path]],
     tasks_by_root: dict[Path, dict[int, str]],
     max_frames: int | None,
+    noop_thresholds: tuple[float, float] | None,
 ) -> type:
     class UtokyoXarmPickAndPlaceConvertedExternallyToRlds(tfds.core.GeneratorBasedBuilder):
         VERSION = tfds.core.Version("1.0.0")
@@ -258,6 +295,7 @@ def make_builder_class(
                     image_module=image_module,
                     task_map=tasks_by_root[dataset_root],
                     max_frames=max_frames,
+                    noop_thresholds=noop_thresholds,
                 )
 
     return UtokyoXarmPickAndPlaceConvertedExternallyToRlds
@@ -278,6 +316,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--max-frames-per-episode", type=int, default=None)
+    parser.add_argument(
+        "--filter-noops",
+        action="store_true",
+        help="Drop frames with near-zero motion and unchanged gripper (mirrors pi0 remove_zero).",
+    )
+    parser.add_argument(
+        "--noop-pos-thresh",
+        type=float,
+        default=0.02,
+        help="Translation threshold in cm/step below which a frame counts as idle.",
+    )
+    parser.add_argument(
+        "--noop-rot-thresh",
+        type=float,
+        default=0.002,
+        help="Rotation threshold in rad/step below which a frame counts as idle.",
+    )
     return parser.parse_args()
 
 
@@ -297,6 +352,8 @@ def main() -> None:
         shutil.rmtree(output_dataset_dir)
     args.tfds_data_dir.mkdir(parents=True, exist_ok=True)
 
+    noop_thresholds = (args.noop_pos_thresh, args.noop_rot_thresh) if args.filter_noops else None
+
     builder_cls = make_builder_class(
         tfds=tfds,
         pq=pq,
@@ -305,6 +362,7 @@ def main() -> None:
         val_episodes=val_episodes,
         tasks_by_root=tasks_by_root,
         max_frames=args.max_frames_per_episode,
+        noop_thresholds=noop_thresholds,
     )
     builder = builder_cls(data_dir=str(args.tfds_data_dir))
     if builder.name != DATASET_NAME:
@@ -314,6 +372,10 @@ def main() -> None:
     print(f"[info] data root: {args.tfds_data_dir}")
     print(f"[info] train episodes: {len(train_episodes)}")
     print(f"[info] val episodes: {len(val_episodes)}")
+    if noop_thresholds is not None:
+        print(f"[info] no-op filter: pos<{noop_thresholds[0]}cm and rot<{noop_thresholds[1]}rad (gripper changes kept)")
+    else:
+        print("[info] no-op filter: OFF (pass --filter-noops to enable)")
     builder.download_and_prepare()
     print(f"[done] wrote: {builder.data_dir}")
 

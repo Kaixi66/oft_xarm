@@ -28,19 +28,26 @@ Full conversion:
 python /workspace/kaixi/RealWorld/lerobot_to_rlds.py --overwrite
 ```
 
-Split conversion for training the two settings separately:
+Split conversion for training the two settings separately. `--filter-noops`
+drops idle frames (~30% of the raw data: near-zero motion, unchanged gripper),
+matching the `remove_zero` filtering used for the pi0 checkpoints; without it
+the policy learns to stand still at episode starts:
 
 ```bash
 python /workspace/kaixi/RealWorld/lerobot_to_rlds.py \
-  --overwrite \
+  --overwrite --filter-noops \
   --dataset-root /root/angli/hf_cache/lerobot/lab/xarm_setting1_51 \
   --tfds-data-dir /workspace/kaixi/RealWorld/rlds_data_setting1
 
 python /workspace/kaixi/RealWorld/lerobot_to_rlds.py \
-  --overwrite \
+  --overwrite --filter-noops \
   --dataset-root /root/angli/hf_cache/lerobot/lab/xarm_setting2_51 \
   --tfds-data-dir /workspace/kaixi/RealWorld/rlds_data_setting2
 ```
+
+Thresholds are tunable via `--noop-pos-thresh` (cm/step, default 0.02) and
+`--noop-rot-thresh` (rad/step, default 0.002). Gripper open/close transition
+frames are always kept.
 
 Train OpenVLA-OFT on one setting:
 
