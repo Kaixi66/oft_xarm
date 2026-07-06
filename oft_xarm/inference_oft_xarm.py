@@ -229,6 +229,12 @@ class AsyncInferenceWorker:
         self._cam_pool = ThreadPoolExecutor(max_workers=2)
         self._queue = collections.deque()
         self._lock = threading.Lock()
+        # Monotonic count of actions actually popped by the executor; used to
+        # measure how many actions ran while an inference was in flight.
+        self._popped_total = 0
+        # Incremented on every queue flush; a chunk whose observation predates
+        # the latest flush (e.g. taken mid-gripper-motion) must be discarded.
+        self._flush_epoch = 0
         self._thread = None
         self._running = False
 
@@ -292,20 +298,36 @@ class AsyncInferenceWorker:
                     continue
 
                 try:
+                    with self._lock:
+                        popped_before = self._popped_total
+                        epoch_before = self._flush_epoch
                     state = get_xarm_state_cached(self.arm, self.proprio_dim)
                     actions = self._infer_once(state)
                     self.infer_count += 1
 
                     with self._lock:
+                        if self._flush_epoch != epoch_before:
+                            self._log_queue.append(
+                                f"  INFER #{self.infer_count} | "
+                                f"discarded chunk from pre-flush observation | "
+                                f"cam={self.last_cam_ms:.0f}ms infer={self.last_infer_ms:.0f}ms"
+                            )
+                            continue
+
+                        consumed = min(self._popped_total - popped_before, len(actions))
                         remaining = list(self._queue)
                         self._queue.clear()
 
-                        consumed = max(0, self.overlap_k - len(remaining))
                         n_overlap = min(len(remaining), len(actions) - consumed)
 
                         for i in range(n_overlap):
                             w_new = (i + 1) / (n_overlap + 1)
-                            remaining[i] = (1.0 - w_new) * remaining[i] + w_new * actions[consumed + i]
+                            blended = (1.0 - w_new) * remaining[i] + w_new * actions[consumed + i]
+                            # The gripper command is binarized by sign downstream;
+                            # blending -1/+1 across chunks crosses zero and can
+                            # trigger it early, so take the newer chunk's value.
+                            blended[6:] = actions[consumed + i][6:]
+                            remaining[i] = blended
 
                         self._queue.extend(remaining[:n_overlap])
                         self._queue.extend(actions[consumed + n_overlap:])
@@ -325,7 +347,10 @@ class AsyncInferenceWorker:
 
     def pop_action(self):
         with self._lock:
-            return self._queue.popleft() if self._queue else None
+            if not self._queue:
+                return None
+            self._popped_total += 1
+            return self._queue.popleft()
 
     def queue_len(self) -> int:
         with self._lock:
@@ -369,6 +394,7 @@ def flush_action_queue(worker: AsyncInferenceWorker) -> int:
     with worker._lock:
         stale = len(worker._queue)
         worker._queue.clear()
+        worker._flush_epoch += 1
     return stale
 
 
