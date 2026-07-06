@@ -69,7 +69,6 @@ def main() -> None:
         raise FileExistsError(f"Output directory already exists and is not empty: {output_dir}")
 
     register_openvla_auto_classes()
-    copy_oft_sidecars(checkpoint_dir, output_dir)
 
     print(f"Loading base model: {args.base_checkpoint}")
     base_vla = AutoModelForVision2Seq.from_pretrained(
@@ -86,12 +85,19 @@ def main() -> None:
     print("Merging LoRA weights into base model...")
     merged_vla = merged_vla.merge_and_unload()
 
-    print(f"Saving merged model to: {output_dir}")
-    merged_vla.save_pretrained(
-        output_dir,
-        safe_serialization=True,
-        max_shard_size=args.max_shard_size,
-    )
+    try:
+        print(f"Saving merged model to: {output_dir}")
+        merged_vla.save_pretrained(
+            output_dir,
+            safe_serialization=True,
+            max_shard_size=args.max_shard_size,
+        )
+        copy_oft_sidecars(checkpoint_dir, output_dir)
+    except BaseException:
+        # A partial output dir blocks retries and can be mistaken for a
+        # loadable checkpoint; the guard above ensures it was empty before.
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise
 
     print(f"Done in {time.time() - start:.1f}s")
 
