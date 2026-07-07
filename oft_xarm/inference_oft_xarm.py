@@ -3,9 +3,9 @@
 
 This script reuses the lab xArm hardware loop:
 - two RealSense RGB streams
-- 6-dim xArm joint state in radians, padded to the current 8-dim OFT proprio
-- asynchronous action queue
-- interpolated Cartesian servo execution
+- 6-dim xArm joint state in radians
+- 25-step open-loop action chunks by default
+- interpolated Cartesian servo execution for each action
 - basic gripper control from action[6]
 
 The model call is adapted for OpenVLA-OFT's HTTP /act server. Gripper output
@@ -14,10 +14,13 @@ action[6] is binarized: positive closes the xArm gripper, non-positive opens it.
 
 import argparse
 import collections
+import select
 import signal
 import sys
+import termios
 import time
 import threading
+import tty
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -48,6 +51,7 @@ except ImportError:
 
 DEFAULT_EXTERNAL_CAM_SERIAL = "215222078407"
 DEFAULT_WRIST_CAM_SERIAL = "845112070404"
+DEFAULT_RESET_POSITION_DEG = [-87.862963, -11.723519, -70.560039, 2.650331, -56.14253, 180.583577]
 
 MAX_POS_DELTA_MM = 200.0
 MAX_ROT_DELTA_RAD = 1.0
@@ -69,6 +73,52 @@ def require_hardware_dependencies() -> None:
             + ", ".join(missing)
             + ". Run this script in the xArm/RealSense client environment."
         )
+
+
+class KeyListener:
+    """Non-blocking single-key listener for interactive reset."""
+
+    def __init__(self, reset_key: str = "r", enabled: bool = True):
+        self.reset_key = reset_key.lower()
+        self.enabled = enabled
+        self._pressed = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._old_settings = None
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        if not sys.stdin.isatty():
+            self.enabled = False
+            print("  Keyboard reset disabled: stdin is not a TTY")
+            return
+        self._old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if not readable:
+                continue
+            ch = sys.stdin.read(1)
+            if ch.lower() == self.reset_key:
+                self._pressed.set()
+
+    def check_and_clear(self) -> bool:
+        if self._pressed.is_set():
+            self._pressed.clear()
+            return True
+        return False
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        if self._old_settings is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
+            self._old_settings = None
 
 
 class RealsenseCapture:
@@ -149,17 +199,18 @@ class OFTActionClient:
 
 
 def get_xarm_state_cached(arm: XArmAPI, proprio_dim: int) -> np.ndarray:
-    """Read 6 joint angles in radians and pad to the proprio dimension used by OFT."""
-    if proprio_dim < 6:
-        raise ValueError(f"proprio_dim must be >= 6, got {proprio_dim}")
+    """Read the 6 xArm joint angles in radians."""
+    if proprio_dim != 6:
+        raise ValueError(
+            f"xArm OFT proprio is 6-dim without padding; got --proprio-dim {proprio_dim}. "
+            "Use a checkpoint trained with PROPRIO_DIM=6."
+        )
 
     angles_deg = arm.angles
     if angles_deg is None:
         raise RuntimeError("arm.angles returned None (report stream not ready?)")
 
-    state = np.zeros(proprio_dim, dtype=np.float32)
-    state[:6] = np.asarray(angles_deg[:6], dtype=np.float32) * DEG2RAD
-    return state
+    return np.asarray(angles_deg[:6], dtype=np.float32) * DEG2RAD
 
 
 def crop_and_resize(
@@ -212,6 +263,7 @@ class AsyncInferenceWorker:
         prompt: str,
         arm: XArmAPI,
         overlap_k: int,
+        num_open_loop_steps: int,
         proprio_dim: int,
         wrist_crop: str,
         external_crop: str,
@@ -222,6 +274,7 @@ class AsyncInferenceWorker:
         self.prompt = prompt
         self.arm = arm
         self.overlap_k = overlap_k
+        self.num_open_loop_steps = num_open_loop_steps
         self.proprio_dim = proprio_dim
         self.wrist_crop = wrist_crop
         self.external_crop = external_crop
@@ -270,9 +323,13 @@ class AsyncInferenceWorker:
         return actions
 
     def run_first_sync(self):
+        return self.refill_sync()
+
+    def refill_sync(self):
         state = get_xarm_state_cached(self.arm, self.proprio_dim)
         actions = self._infer_once(state)
-        self.infer_count = 1
+        actions = actions[: self.num_open_loop_steps]
+        self.infer_count += 1
         with self._lock:
             self._queue.extend(actions)
         return len(actions), self.last_cam_ms, self.last_infer_ms
@@ -303,6 +360,7 @@ class AsyncInferenceWorker:
                         epoch_before = self._flush_epoch
                     state = get_xarm_state_cached(self.arm, self.proprio_dim)
                     actions = self._infer_once(state)
+                    actions = actions[: self.num_open_loop_steps]
                     self.infer_count += 1
 
                     with self._lock:
@@ -405,6 +463,64 @@ def enter_servo_mode(arm: XArmAPI) -> None:
     print("  Entered servo mode (mode=1)")
 
 
+def reset_to_home(
+    arm: XArmAPI,
+    worker: AsyncInferenceWorker,
+    reset_angles_deg: list[float],
+    *,
+    reset_speed: float,
+    reset_pause: float,
+    servo_dt: float,
+    dry_run: bool,
+    async_requery: bool,
+) -> np.ndarray:
+    """Move to the configured reset joint pose and return a re-synced TCP pose."""
+    print("\n  [RESET] 'R' pressed: stopping policy actions and moving to reset pose...")
+
+    if async_requery:
+        worker.stop()
+
+    stale = flush_action_queue(worker)
+    print(f"  [RESET] Cleared {stale} queued actions")
+
+    if dry_run:
+        print(f"  [RESET] dry-run: would move joints to {reset_angles_deg}")
+    else:
+        arm.set_mode(0)
+        arm.set_state(0)
+        time.sleep(0.5)
+        code = arm.set_servo_angle(angle=reset_angles_deg, speed=reset_speed, is_radian=False, wait=True)
+        if code != 0:
+            raise RuntimeError(f"set_servo_angle reset failed: code={code}")
+        print(f"  [RESET] Reached reset joint pose: {reset_angles_deg}")
+
+    if reset_pause > 0:
+        print(f"  [RESET] Pausing {reset_pause:.1f}s...")
+        if dry_run:
+            time.sleep(reset_pause)
+        else:
+            code, pose = arm.get_position(is_radian=True)
+            if code == 0:
+                servo_hold(arm, np.array(pose[:6], dtype=np.float64), servo_dt, reset_pause)
+            else:
+                time.sleep(reset_pause)
+
+    code, new_pose = arm.get_position(is_radian=True)
+    if code != 0:
+        raise RuntimeError(f"get_position failed after reset: code={code}")
+    tracked_pose = np.array(new_pose[:6], dtype=np.float64)
+    print(f"  [RESET] Tracked pose re-synced: [{', '.join(f'{v:.2f}' for v in tracked_pose)}]")
+
+    if not dry_run:
+        enter_servo_mode(arm)
+
+    if async_requery:
+        worker.start()
+
+    print("  [RESET] Done. Next step will use a fresh observation/action chunk.\n")
+    return tracked_pose
+
+
 def build_server_endpoint(args) -> str:
     if args.server_url:
         return args.server_url.rstrip("/")
@@ -418,6 +534,8 @@ def parse_args():
     parser.add_argument("--max-steps", type=int, default=30000)
     parser.add_argument("--action-hz", type=float, default=10.0)
     parser.add_argument("--servo-hz", type=float, default=100.0)
+    parser.add_argument("--num-open-loop-steps", type=int, default=25)
+    parser.add_argument("--async-requery", action="store_true", help="Use legacy overlap/blending requery")
     parser.add_argument("--overlap-k", type=int, default=5)
 
     parser.add_argument("--host", default="127.0.0.1", help="OFT server host")
@@ -425,7 +543,7 @@ def parse_args():
     parser.add_argument("--server-url", default="", help="Full OFT /act URL; overrides host/port")
     parser.add_argument("--request-timeout", type=float, default=120.0)
 
-    parser.add_argument("--proprio-dim", type=int, default=8, help="Current OFT xArm checkpoint uses 8")
+    parser.add_argument("--proprio-dim", type=int, default=6, help="xArm OFT proprio dimension; must be 6")
     parser.add_argument("--external-cam-serial", default=DEFAULT_EXTERNAL_CAM_SERIAL)
     parser.add_argument("--wrist-cam-serial", default=DEFAULT_WRIST_CAM_SERIAL)
     parser.add_argument("--camera-width", type=int, default=1920)
@@ -439,6 +557,10 @@ def parse_args():
     parser.add_argument("--max-delta-rad", type=float, default=1.0)
     parser.add_argument("--dry-run", action="store_true", help="Run inference and timing without moving the arm")
     parser.add_argument("--verbose-actions", action="store_true")
+    parser.add_argument("--disable-keyboard-reset", action="store_true", help="Disable press-R reset to home pose")
+    parser.add_argument("--reset-position-deg", type=float, nargs=6, default=DEFAULT_RESET_POSITION_DEG)
+    parser.add_argument("--reset-speed", type=float, default=30.0)
+    parser.add_argument("--reset-pause", type=float, default=2.0)
 
     parser.add_argument("--disable-gripper", action="store_true", help="Ignore action[6] and do not command gripper")
     parser.add_argument("--gripper-open-pos", type=int, default=850)
@@ -459,12 +581,16 @@ def main() -> None:
     action_dt = substeps * servo_dt
     endpoint = build_server_endpoint(args)
 
+    if args.num_open_loop_steps <= 0:
+        raise ValueError(f"--num-open-loop-steps must be positive, got {args.num_open_loop_steps}")
+
     if not 30.0 <= args.servo_hz <= 250.0:
         print(f"WARNING: servo_hz={args.servo_hz} is outside servo mode range [30, 250]")
 
-    min_overlap_k = int(np.ceil(0.45 / (1.0 / args.action_hz)))
-    if args.overlap_k < min_overlap_k:
-        print(f"WARNING: overlap_k={args.overlap_k} may be too small. Recommended >= {min_overlap_k}")
+    if args.async_requery:
+        min_overlap_k = int(np.ceil(0.45 / (1.0 / args.action_hz)))
+        if args.overlap_k < min_overlap_k:
+            print(f"WARNING: overlap_k={args.overlap_k} may be too small. Recommended >= {min_overlap_k}")
 
     require_hardware_dependencies()
 
@@ -472,9 +598,15 @@ def main() -> None:
     cam_external = None
     cam_wrist = None
     worker = None
+    key_listener = None
 
     def cleanup(signum=None, frame=None):
         print("\nCleaning up...")
+        if key_listener is not None:
+            try:
+                key_listener.stop()
+            except Exception:
+                pass
         if worker is not None:
             try:
                 worker.shutdown()
@@ -565,6 +697,7 @@ def main() -> None:
             prompt=args.prompt,
             arm=arm,
             overlap_k=args.overlap_k,
+            num_open_loop_steps=args.num_open_loop_steps,
             proprio_dim=args.proprio_dim,
             wrist_crop=args.wrist_crop,
             external_crop=args.external_crop,
@@ -579,15 +712,26 @@ def main() -> None:
         else:
             print("  Dry run enabled: servo mode and motion commands are skipped")
 
-        worker.start()
+        if args.async_requery:
+            worker.start()
+
+        key_listener = KeyListener(enabled=not args.disable_keyboard_reset)
+        key_listener.start()
+        if key_listener.enabled:
+            print("  Press 'R' to reset arm to the configured joint pose.\n")
 
         move_ok = 0
         hold_steps = 0
+        reset_count = 0
 
         print("\nStarting control loop (OpenVLA-OFT):")
         print(f"  action_hz={args.action_hz}, servo_hz={args.servo_hz}")
         print(f"  substeps={substeps}, servo_dt={servo_dt * 1000:.1f}ms, action_dt={action_dt * 1000:.0f}ms")
-        print(f"  overlap_k={args.overlap_k}, proprio_dim={args.proprio_dim}\n")
+        print(
+            f"  open_loop_steps={args.num_open_loop_steps}, "
+            f"async_requery={args.async_requery}, overlap_k={args.overlap_k}, "
+            f"proprio_dim={args.proprio_dim}\n"
+        )
         if gripper_enabled:
             print(
                 "  gripper=enabled "
@@ -599,6 +743,21 @@ def main() -> None:
 
         for step in range(args.max_steps):
             t_step_start = time.perf_counter()
+
+            if key_listener is not None and key_listener.check_and_clear():
+                reset_count += 1
+                tracked_pose = reset_to_home(
+                    arm,
+                    worker,
+                    list(args.reset_position_deg),
+                    reset_speed=args.reset_speed,
+                    reset_pause=args.reset_pause,
+                    servo_dt=servo_dt,
+                    dry_run=args.dry_run,
+                    async_requery=args.async_requery,
+                )
+                print(f"  Reset #{reset_count} complete. Continuing from step {step}.")
+                continue
 
             if not args.dry_run and (arm.error_code != 0 or arm.state == 4):
                 print(f"  Step {step}: arm error={arm.error_code} state={arm.state}, recovering...")
@@ -623,13 +782,23 @@ def main() -> None:
             action = worker.pop_action()
 
             if action is None:
-                if args.dry_run:
-                    time.sleep(action_dt)
-                else:
-                    servo_hold(arm, tracked_pose, servo_dt, action_dt)
-                hold_steps += 1
-                print(f"  Step {step:03d} | HOLD (queue empty) | total_holds={hold_steps}")
-                continue
+                if args.async_requery:
+                    if args.dry_run:
+                        time.sleep(action_dt)
+                    else:
+                        servo_hold(arm, tracked_pose, servo_dt, action_dt)
+                    hold_steps += 1
+                    print(f"  Step {step:03d} | HOLD (queue empty) | total_holds={hold_steps}")
+                    continue
+
+                print("  Requerying model for next open-loop chunk...")
+                n_next, cam_ms_next, infer_ms_next = worker.refill_sync()
+                print(f"  Requery done: {n_next} actions, cam={cam_ms_next:.0f}ms, infer={infer_ms_next:.0f}ms")
+                action = worker.pop_action()
+                if action is None:
+                    hold_steps += 1
+                    print(f"  Step {step:03d} | HOLD (empty chunk) | total_holds={hold_steps}")
+                    continue
 
             queue_len = worker.queue_len()
             if args.verbose_actions:
@@ -703,7 +872,10 @@ def main() -> None:
                 f"Act: {t_act * 1000:>3.0f}ms | Q:{queue_len}"
             )
 
-        print(f"\nControl loop finished: ok={move_ok}, inferences={worker.infer_count}, holds={hold_steps}")
+        print(
+            f"\nControl loop finished: ok={move_ok}, inferences={worker.infer_count}, "
+            f"holds={hold_steps}, resets={reset_count}"
+        )
 
     except Exception as exc:
         print(f"Error: {exc}")

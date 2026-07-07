@@ -26,7 +26,7 @@ PORT="${PORT:-8777}"
 # Model options — keep in sync with how the checkpoint was trained.
 USE_L1_REGRESSION="${USE_L1_REGRESSION:-True}"
 USE_DIFFUSION="${USE_DIFFUSION:-False}"
-USE_FILM="${USE_FILM:-False}"
+USE_FILM="${USE_FILM:-True}"
 NUM_IMAGES_IN_INPUT="${NUM_IMAGES_IN_INPUT:-2}"
 USE_PROPRIO="${USE_PROPRIO:-True}"
 CENTER_CROP="${CENTER_CROP:-True}"
@@ -47,11 +47,11 @@ PYTHON="${PYTHON:-${CONDA_ENV}/bin/python}"
 
 case "${TASK}" in
     setting1)
-        DEFAULT_CHECKPOINT="${REALWORLD_ROOT}/openvla_oft_runs/merged_public_checkpoints/openvla-oft_setting1"
+        DEFAULT_CHECKPOINT="${REALWORLD_ROOT}/openvla_oft_runs/merged_public_checkpoints/openvla-oft_setting1_proprio6_chunk25"
         EXAMPLE_PROMPT="put the red cube into the plastic cup"
         ;;
     setting2)
-        DEFAULT_CHECKPOINT="${REALWORLD_ROOT}/openvla_oft_runs/merged_public_checkpoints/openvla-oft_setting2"
+        DEFAULT_CHECKPOINT="${REALWORLD_ROOT}/openvla_oft_runs/merged_public_checkpoints/openvla-oft_setting2_proprio6_chunk25"
         EXAMPLE_PROMPT="stack the red cup on top of the green cup"
         ;;
     *)
@@ -77,6 +77,39 @@ if [[ ! -f "${CHECKPOINT}/config.json" ]]; then
     echo "  ${PYTHON} ${REALWORLD_ROOT}/merge_oft_lora_to_base.py --checkpoint-dir <lora_run_dir> --output-dir <merged_dir>" >&2
     exit 1
 fi
+
+"${PYTHON}" - "${CHECKPOINT}" "${USE_FILM}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+checkpoint = Path(sys.argv[1])
+requested_film = sys.argv[2].lower() in {"1", "true", "yes", "y"}
+metadata_path = checkpoint / "oft_training_config.json"
+vision_backbones = sorted(checkpoint.glob("vision_backbone--*.pt"))
+
+if metadata_path.exists():
+    metadata = json.loads(metadata_path.read_text())
+    trained_film = bool(metadata.get("use_film", False))
+    if trained_film != requested_film:
+        raise SystemExit(
+            f"[serve_oft_xarm] FiLM mismatch: checkpoint use_film={trained_film}, "
+            f"but USE_FILM={requested_film}. Checkpoint: {checkpoint}"
+        )
+else:
+    print(f"[serve_oft_xarm] warning: no oft_training_config.json in {checkpoint}; checking sidecars only")
+
+if requested_film and not vision_backbones:
+    raise SystemExit(
+        f"[serve_oft_xarm] USE_FILM=True but no vision_backbone--*.pt found in {checkpoint}. "
+        "Use a FiLM-trained merged checkpoint."
+    )
+if not requested_film and vision_backbones:
+    raise SystemExit(
+        f"[serve_oft_xarm] USE_FILM=False but FiLM vision backbone sidecar exists in {checkpoint}. "
+        "Set USE_FILM=True or use a non-FiLM checkpoint."
+    )
+PY
 
 cd "${REPO_DIR}"
 export PYTHONPATH="${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -107,6 +140,7 @@ echo "  task:       ${TASK}"
 echo "  checkpoint: ${CHECKPOINT}"
 echo "  endpoint:   http://${HOST}:${PORT}/act"
 echo "  unnorm_key: ${UNNORM_KEY}"
+echo "  use_film:   ${USE_FILM}"
 echo "  images:     ${NUM_IMAGES_IN_INPUT}"
 echo "  proprio:    ${USE_PROPRIO}"
 echo "  prompt e.g. \"${EXAMPLE_PROMPT}\""

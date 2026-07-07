@@ -311,7 +311,7 @@ def parse_args() -> argparse.Namespace:
         help="LeRobot dataset root. Can be passed multiple times.",
     )
     parser.add_argument("--tfds-data-dir", type=Path, default=DEFAULT_TFDS_DATA_DIR)
-    parser.add_argument("--val-ratio", type=float, default=0.05)
+    parser.add_argument("--val-ratio", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--max-episodes", type=int, default=None)

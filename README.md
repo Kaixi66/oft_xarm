@@ -22,7 +22,8 @@ python /workspace/kaixi/RealWorld/lerobot_to_rlds.py \
   --max-frames-per-episode 16
 ```
 
-Full conversion:
+Full conversion. By default `--val-ratio=0.0`, so all episodes go into the
+`train` split and no `val` split is written:
 
 ```bash
 python /workspace/kaixi/RealWorld/lerobot_to_rlds.py --overwrite
@@ -31,7 +32,8 @@ python /workspace/kaixi/RealWorld/lerobot_to_rlds.py --overwrite
 Split conversion for training the two settings separately. `--filter-noops`
 drops idle frames (~30% of the raw data: near-zero motion, unchanged gripper),
 matching the `remove_zero` filtering used for the pi0 checkpoints; without it
-the policy learns to stand still at episode starts:
+the policy learns to stand still at episode starts. These commands also keep
+all episodes in `train` by default:
 
 ```bash
 python /workspace/kaixi/RealWorld/lerobot_to_rlds.py \
@@ -57,6 +59,22 @@ TASK=setting1 ./train_oft_realworld.sh
 TASK=setting2 ./train_oft_realworld.sh
 
 TASK=setting1 RUN_NAME=xarm_setting1_test01 ./train_oft_realworld.sh
+```
+
+The default real-world run names are intentionally versioned for the current
+OFT setup:
+
+```text
+openvla-oft_setting1_proprio6_chunk25
+openvla-oft_setting2_proprio6_chunk25
+```
+
+After training, merge the LoRA checkpoint before serving:
+
+```bash
+python /workspace/kaixi/RealWorld/merge_oft_lora_to_base.py \
+  --checkpoint-dir /workspace/kaixi/RealWorld/openvla_oft_runs/checkpoints/openvla-oft_setting1_proprio6_chunk25 \
+  --output-dir /workspace/kaixi/RealWorld/openvla_oft_runs/merged_public_checkpoints/openvla-oft_setting1_proprio6_chunk25
 ```
 
 Train OpenVLA-OFT with:

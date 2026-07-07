@@ -4,7 +4,7 @@ set -euo pipefail
 # OpenVLA-OFT launcher for the local real-world LeRobot -> RLDS XArm data.
 # Common usage:
 #   TASK=setting1 ./train_oft_realworld.sh
-#   TASK=setting2 GPUS=0,1 BATCH_SIZE=2 ./train_oft_realworld.sh
+#   TASK=setting2 GPUS=0,1 BATCH_SIZE=16 ./train_oft_realworld.sh
 #   DRY_RUN=true TASK=setting1 ./train_oft_realworld.sh
 
 #########################
@@ -17,30 +17,30 @@ set -euo pipefail
 TASK="${TASK:-setting2}"
 
 GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
 GRAD_ACCUMULATION_STEPS="${GRAD_ACCUMULATION_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-5e-4}"
 LORA_RANK="${LORA_RANK:-32}"
-MAX_STEPS="${MAX_STEPS:-50005}"
-NUM_STEPS_BEFORE_DECAY="${NUM_STEPS_BEFORE_DECAY:-25000}"
+MAX_STEPS="${MAX_STEPS:-100005}"
+NUM_STEPS_BEFORE_DECAY="${NUM_STEPS_BEFORE_DECAY:-50000}"
 SAVE_FREQ="${SAVE_FREQ:-10000}"
 SAVE_LATEST_CHECKPOINT_ONLY="${SAVE_LATEST_CHECKPOINT_ONLY:-True}"
-SHUFFLE_BUFFER_SIZE="${SHUFFLE_BUFFER_SIZE:-10000}"
+SHUFFLE_BUFFER_SIZE="${SHUFFLE_BUFFER_SIZE:-100000}"
 
 USE_L1_REGRESSION="${USE_L1_REGRESSION:-True}"
 USE_DIFFUSION="${USE_DIFFUSION:-False}"
-USE_FILM="${USE_FILM:-False}"
+USE_FILM="${USE_FILM:-True}"
 NUM_IMAGES_IN_INPUT="${NUM_IMAGES_IN_INPUT:-2}"
 USE_PROPRIO="${USE_PROPRIO:-True}"
 IMAGE_AUG="${IMAGE_AUG:-True}"
 USE_LORA="${USE_LORA:-True}"
 MERGE_LORA_DURING_TRAINING="${MERGE_LORA_DURING_TRAINING:-False}"
 
-USE_VAL_SET="${USE_VAL_SET:-True}"
+USE_VAL_SET="${USE_VAL_SET:-False}"
 VAL_FREQ="${VAL_FREQ:-2500}"
 VAL_TIME_LIMIT="${VAL_TIME_LIMIT:-180}"
 
-RUN_NAME="${RUN_NAME:-openvla-oft_setting2}"
+RUN_NAME="${RUN_NAME:-oft_setting2_paper}"
 
 WANDB_ENTITY="${WANDB_ENTITY:-optimal-training-strategy}"
 WANDB_PROJECT="${WANDB_PROJECT:-RealWorld}"
@@ -71,14 +71,17 @@ case "${TASK}" in
     setting1)
         DEFAULT_DATA_ROOT_DIR="${REALWORLD_ROOT}/rlds_data_setting1"
         DEFAULT_EXP_PREFIX="xarm_setting1_oft"
+        DEFAULT_RUN_NAME="openvla-oft_setting1_proprio6_chunk25"
         ;;
     setting2)
         DEFAULT_DATA_ROOT_DIR="${REALWORLD_ROOT}/rlds_data_setting2"
         DEFAULT_EXP_PREFIX="xarm_setting2_oft"
+        DEFAULT_RUN_NAME="openvla-oft_setting2_proprio6_chunk25"
         ;;
     merged)
         DEFAULT_DATA_ROOT_DIR="${REALWORLD_ROOT}/rlds_data"
         DEFAULT_EXP_PREFIX="xarm_merged_oft"
+        DEFAULT_RUN_NAME="openvla-oft_merged_proprio6_chunk25"
         ;;
     *)
         echo "[train_oft_realworld] TASK must be one of: setting1, setting2, merged" >&2
@@ -102,7 +105,7 @@ fi
 if [[ -n "${RUN_NAME}" ]]; then
     EXP_NAME="${RUN_NAME}"
 else
-    EXP_NAME="${EXP_NAME:-${DEFAULT_EXP_PREFIX}_g${NPROC_PER_NODE}_b${BATCH_SIZE}_s${MAX_STEPS}_${current_time}}"
+    EXP_NAME="${EXP_NAME:-${DEFAULT_RUN_NAME}}"
 fi
 log_file="${LOG_FILE:-${LOG_DIR}/${EXP_NAME}.log}"
 dataset_dir="${DATA_ROOT_DIR}/${DATASET_NAME}"
@@ -187,6 +190,7 @@ cat <<EOF
 [train_oft_realworld] use_film: ${USE_FILM}
 [train_oft_realworld] num_images_in_input: ${NUM_IMAGES_IN_INPUT}
 [train_oft_realworld] use_proprio: ${USE_PROPRIO}
+[train_oft_realworld] expected_constants: XARM chunk=25 action_dim=7 proprio_dim=6
 [train_oft_realworld] save_latest_checkpoint_only: ${SAVE_LATEST_CHECKPOINT_ONLY}
 [train_oft_realworld] merge_lora_during_training: ${MERGE_LORA_DURING_TRAINING}
 [train_oft_realworld] wandb: ${WANDB_ENTITY}/${WANDB_PROJECT} (${WANDB_MODE})
