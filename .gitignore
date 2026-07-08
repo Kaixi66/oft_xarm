@@ -14,6 +14,7 @@ __pycache__/
 *.log
 nohup.out
 .DS_Store
+debug_images/
 
 # Optional local copies from external repos
 openpi_xarm_git-main/

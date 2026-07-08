@@ -14,6 +14,7 @@ action[6] is binarized: positive closes the xArm gripper, non-positive opens it.
 
 import argparse
 import collections
+import os
 import select
 import signal
 import sys
@@ -22,6 +23,7 @@ import time
 import threading
 import tty
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import requests
@@ -52,6 +54,7 @@ except ImportError:
 DEFAULT_EXTERNAL_CAM_SERIAL = "215222078407"
 DEFAULT_WRIST_CAM_SERIAL = "845112070404"
 DEFAULT_RESET_POSITION_DEG = [-87.862963, -11.723519, -70.560039, 2.650331, -56.14253, 180.583577]
+DEFAULT_HARDWARE_PYTHON = "/home/zheyu/code/openpi_xarm/.venv/bin/python"
 
 MAX_POS_DELTA_MM = 200.0
 MAX_ROT_DELTA_RAD = 1.0
@@ -68,10 +71,26 @@ def require_hardware_dependencies() -> None:
     if XArmAPI is None:
         missing.append("xarm-python-sdk")
     if missing:
+        hardware_python = os.environ.get("OFT_XARM_CLIENT_PYTHON", DEFAULT_HARDWARE_PYTHON)
+        already_reexeced = os.environ.get("OFT_XARM_REEXECED") == "1"
+        current_python = os.path.realpath(sys.executable)
+        target_python = os.path.realpath(hardware_python)
+        invoked_as_script = os.path.exists(sys.argv[0]) and os.path.realpath(sys.argv[0]) == os.path.realpath(__file__)
+
+        if invoked_as_script and not already_reexeced and os.path.exists(hardware_python) and current_python != target_python:
+            print(
+                "Wrong Python environment for RealSense/xArm client; "
+                f"re-executing with {hardware_python}",
+                flush=True,
+            )
+            os.environ["OFT_XARM_REEXECED"] = "1"
+            os.execv(hardware_python, [hardware_python, os.path.abspath(__file__), *sys.argv[1:]])
+
         raise RuntimeError(
             "Missing hardware runtime dependencies: "
             + ", ".join(missing)
-            + ". Run this script in the xArm/RealSense client environment."
+            + f". Current Python: {sys.executable}. "
+            + f"Run with {hardware_python}, or use ./run_inference_oft_xarm.sh."
         )
 
 
@@ -252,6 +271,10 @@ def crop_and_resize(
     return np.array(pil_resized)
 
 
+def save_debug_image(path: Path, image: np.ndarray) -> None:
+    Image.fromarray(image).save(path, quality=95)
+
+
 class AsyncInferenceWorker:
     """Keeps the action queue filled using background camera capture and OFT inference."""
 
@@ -267,6 +290,8 @@ class AsyncInferenceWorker:
         proprio_dim: int,
         wrist_crop: str,
         external_crop: str,
+        debug_image_dir: str,
+        debug_image_every: int,
     ):
         self.client = client
         self.cam_wrist = cam_wrist
@@ -278,6 +303,11 @@ class AsyncInferenceWorker:
         self.proprio_dim = proprio_dim
         self.wrist_crop = wrist_crop
         self.external_crop = external_crop
+        self.debug_image_dir = Path(debug_image_dir).expanduser() if debug_image_dir else None
+        self.debug_image_every = max(1, debug_image_every)
+        self._debug_capture_count = 0
+        if self.debug_image_dir is not None:
+            self.debug_image_dir.mkdir(parents=True, exist_ok=True)
 
         self._cam_pool = ThreadPoolExecutor(max_workers=2)
         self._queue = collections.deque()
@@ -296,19 +326,49 @@ class AsyncInferenceWorker:
         self.last_infer_ms = 0.0
         self._log_queue = collections.deque()
 
-    def _capture_wrist(self) -> np.ndarray:
-        return crop_and_resize(self.cam_wrist.get_frame(), crop_mode=self.wrist_crop)
+    def _capture_wrist(self) -> tuple[np.ndarray, np.ndarray]:
+        raw = self.cam_wrist.get_frame()
+        return raw, crop_and_resize(raw, crop_mode=self.wrist_crop)
 
-    def _capture_ext(self) -> np.ndarray:
-        return crop_and_resize(self.cam_external.get_frame(), crop_mode=self.external_crop)
+    def _capture_ext(self) -> tuple[np.ndarray, np.ndarray]:
+        raw = self.cam_external.get_frame()
+        return raw, crop_and_resize(raw, crop_mode=self.external_crop)
+
+    def _save_debug_images(
+        self,
+        raw_wrist: np.ndarray,
+        raw_ext: np.ndarray,
+        img_wrist: np.ndarray,
+        img_ext: np.ndarray,
+    ) -> None:
+        if self.debug_image_dir is None:
+            return
+        self._debug_capture_count += 1
+        if (self._debug_capture_count - 1) % self.debug_image_every != 0:
+            return
+
+        seq = self._debug_capture_count
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        prefix = f"{seq:06d}_{timestamp}"
+        save_debug_image(self.debug_image_dir / f"{prefix}_external_raw.jpg", raw_ext)
+        save_debug_image(
+            self.debug_image_dir / f"{prefix}_external_{self.external_crop}_224.jpg",
+            img_ext,
+        )
+        save_debug_image(self.debug_image_dir / f"{prefix}_wrist_raw.jpg", raw_wrist)
+        save_debug_image(
+            self.debug_image_dir / f"{prefix}_wrist_{self.wrist_crop}_224.jpg",
+            img_wrist,
+        )
 
     def _infer_once(self, state: np.ndarray) -> np.ndarray:
         t0 = time.time()
         fut_w = self._cam_pool.submit(self._capture_wrist)
         fut_e = self._cam_pool.submit(self._capture_ext)
-        img_wrist = fut_w.result()
-        img_ext = fut_e.result()
+        raw_wrist, img_wrist = fut_w.result()
+        raw_ext, img_ext = fut_e.result()
         self.last_cam_ms = (time.time() - t0) * 1000
+        self._save_debug_images(raw_wrist, raw_ext, img_wrist, img_ext)
 
         observation = {
             "full_image": img_ext,
@@ -527,12 +587,34 @@ def build_server_endpoint(args) -> str:
     return f"http://{args.host}:{args.port}/act"
 
 
+def normalize_prompt(prompt: str) -> str:
+    prompt = " ".join(prompt.strip().split())
+    if not prompt:
+        raise ValueError("--prompt/--instruction cannot be empty")
+    return prompt
+
+
+def warn_if_full_openvla_prompt(prompt: str) -> None:
+    lowered = prompt.lower()
+    if "what action should the robot take" in lowered or lowered.startswith("in:"):
+        print(
+            "WARNING: pass only the raw task instruction, not the full OpenVLA prompt. "
+            f"Using instruction text as provided: {prompt!r}"
+        )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="xArm6 + OpenVLA-OFT HTTP inference client")
     parser.add_argument("--xarm-ip", default="192.168.1.230", help="xArm IP address")
-    parser.add_argument("--prompt", default="put the red cube into the plastic cup")
+    parser.add_argument(
+        "--prompt",
+        "--instruction",
+        dest="prompt",
+        default="put the red cube into the plastic cup",
+        help="Raw task instruction, e.g. 'put the red cube into the plastic cup'. Do not include the OpenVLA 'In: ... Out:' wrapper.",
+    )
     parser.add_argument("--max-steps", type=int, default=30000)
-    parser.add_argument("--action-hz", type=float, default=10.0)
+    parser.add_argument("--action-hz", type=float, default=25.0)
     parser.add_argument("--servo-hz", type=float, default=100.0)
     parser.add_argument("--num-open-loop-steps", type=int, default=25)
     parser.add_argument("--async-requery", action="store_true", help="Use legacy overlap/blending requery")
@@ -551,6 +633,17 @@ def parse_args():
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--external-crop", default="left_540")
     parser.add_argument("--wrist-crop", default="right")
+    parser.add_argument(
+        "--debug-image-dir",
+        default="",
+        help="If set, save raw camera frames and cropped 224x224 model inputs during inference.",
+    )
+    parser.add_argument(
+        "--debug-image-every",
+        type=int,
+        default=1,
+        help="Save one image set every N inference requests when --debug-image-dir is set.",
+    )
 
     parser.add_argument("--speed-scale", type=float, default=1.0)
     parser.add_argument("--max-delta-mm", type=float, default=200.0)
@@ -575,6 +668,8 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
+    args.prompt = normalize_prompt(args.prompt)
+    warn_if_full_openvla_prompt(args.prompt)
 
     substeps = max(1, round(args.servo_hz / args.action_hz))
     servo_dt = 1.0 / args.servo_hz
@@ -640,6 +735,7 @@ def main() -> None:
         MAX_POS_DELTA_MM = args.max_delta_mm
         MAX_ROT_DELTA_RAD = args.max_delta_rad
 
+        print(f"Task instruction: {args.prompt!r}")
         print(f"Connecting to OFT server at {endpoint}...")
         client = OFTActionClient(endpoint=endpoint, timeout=args.request_timeout)
 
@@ -701,6 +797,8 @@ def main() -> None:
             proprio_dim=args.proprio_dim,
             wrist_crop=args.wrist_crop,
             external_crop=args.external_crop,
+            debug_image_dir=args.debug_image_dir,
+            debug_image_every=args.debug_image_every,
         )
 
         print("Running first inference (sync, in mode 0)...")
@@ -823,22 +921,28 @@ def main() -> None:
                     print(f"  [{step}] dry-run gripper trigger: {gripper_text}")
                     current_gripper_state = gripper_cmd
                 time.sleep(action_dt)
-            elif gripper_trigger:
-                if gripper_cmd > 0:
-                    print("  [GRASP] Closing gripper...")
-                    arm.set_gripper_speed(args.gripper_close_speed)
-                    arm.set_gripper_position(args.gripper_close_pos, wait=False)
-                    hold_dur = args.gripper_close_hold
-                else:
-                    print("  [RELEASE] Opening gripper...")
-                    arm.set_gripper_position(args.gripper_open_pos, wait=False)
-                    hold_dur = args.gripper_open_hold
-
-                servo_hold(arm, tracked_pose, servo_dt, hold_dur)
-                current_gripper_state = gripper_cmd
-                stale = flush_action_queue(worker)
-                print(f"  Flushed {stale} stale actions from queue after gripper change")
             else:
+                if gripper_trigger:
+                    if gripper_cmd > 0:
+                        print("  [GRASP] Closing gripper...")
+                        arm.set_gripper_speed(args.gripper_close_speed)
+                        arm.set_gripper_position(args.gripper_close_pos, wait=False)
+                        hold_dur = args.gripper_close_hold
+                    else:
+                        print("  [RELEASE] Opening gripper...")
+                        arm.set_gripper_position(args.gripper_open_pos, wait=False)
+                        hold_dur = args.gripper_open_hold
+
+                    if hold_dur > 0:
+                        servo_hold(arm, tracked_pose, servo_dt, hold_dur)
+                    current_gripper_state = gripper_cmd
+
+                    if args.async_requery:
+                        stale = flush_action_queue(worker)
+                        print(f"  Flushed {stale} stale actions from queue after gripper change")
+                    else:
+                        print("  Keeping queued open-loop actions after gripper change")
+
                 pos_delta = action[:3].astype(np.float64) * args.speed_scale
                 pos_norm = np.linalg.norm(pos_delta)
                 if pos_norm > MAX_POS_DELTA_MM:
