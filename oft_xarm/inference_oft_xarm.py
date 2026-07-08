@@ -551,6 +551,9 @@ def reset_to_home(
     servo_dt: float,
     dry_run: bool,
     async_requery: bool,
+    gripper_enabled: bool,
+    gripper_open_pos: int,
+    gripper_speed: int,
 ) -> np.ndarray:
     """Move to the configured reset joint pose and return a re-synced TCP pose."""
     print("\n  [RESET] 'R' pressed: stopping policy actions and moving to reset pose...")
@@ -560,6 +563,17 @@ def reset_to_home(
 
     stale = flush_action_queue(worker)
     print(f"  [RESET] Cleared {stale} queued actions")
+
+    # All demos start with an open gripper, so a trial must too. Open in place
+    # before moving home so anything still held is dropped where it is instead
+    # of being carried across the workspace.
+    if gripper_enabled:
+        if dry_run:
+            print(f"  [RESET] dry-run: would open gripper in place to {gripper_open_pos}")
+        else:
+            print("  [RESET] Opening gripper in place...")
+            arm.set_gripper_speed(gripper_speed)
+            arm.set_gripper_position(gripper_open_pos, wait=True)
 
     if dry_run:
         print(f"  [RESET] dry-run: would move joints to {reset_angles_deg}")
@@ -686,9 +700,13 @@ def parse_args():
     parser.add_argument("--reset-pause", type=float, default=2.0)
 
     parser.add_argument("--disable-gripper", action="store_true", help="Ignore action[6] and do not command gripper")
-    parser.add_argument("--gripper-open-pos", type=int, default=850)
+    parser.add_argument(
+        "--gripper-open-pos",
+        type=int,
+        default=850,
+        help="Open position used at init, on release, and on press-R reset (demos start fully open).",
+    )
     parser.add_argument("--gripper-close-pos", type=int, default=0)
-    parser.add_argument("--gripper-init-pos", type=int, default=800)
     parser.add_argument("--gripper-init-speed", type=int, default=1000)
     parser.add_argument("--gripper-close-speed", type=int, default=5000)
     parser.add_argument("--gripper-open-hold", type=float, default=2.8)
@@ -791,15 +809,17 @@ def main() -> None:
             if args.dry_run:
                 print(
                     "Dry run enabled: gripper init skipped "
-                    f"(would open to {args.gripper_init_pos})"
+                    f"(would open to {args.gripper_open_pos})"
                 )
             else:
+                # Init to the same open position used on release so every trial
+                # starts with an identical gripper aperture (demos start open).
                 current_gripper_state = init_gripper(
                     arm,
-                    open_pos=args.gripper_init_pos,
+                    open_pos=args.gripper_open_pos,
                     speed=args.gripper_init_speed,
                 )
-                print(f"xArm gripper initialized open at position {args.gripper_init_pos}")
+                print(f"xArm gripper initialized open at position {args.gripper_open_pos}")
 
         print("xArm initialized")
 
@@ -890,7 +910,12 @@ def main() -> None:
                     servo_dt=servo_dt,
                     dry_run=args.dry_run,
                     async_requery=args.async_requery,
+                    gripper_enabled=gripper_enabled,
+                    gripper_open_pos=args.gripper_open_pos,
+                    gripper_speed=args.gripper_init_speed,
                 )
+                if gripper_enabled:
+                    current_gripper_state = -1.0
                 print(f"  Reset #{reset_count} complete. Continuing from step {step}.")
                 continue
 
