@@ -53,7 +53,25 @@ except ImportError:
 
 DEFAULT_EXTERNAL_CAM_SERIAL = "215222078407"
 DEFAULT_WRIST_CAM_SERIAL = "845112070404"
-DEFAULT_RESET_POSITION_DEG = [-87.862963, -11.723519, -70.560039, 2.650331, -56.14253, 180.583577]
+
+# Per-task instruction and press-R reset pose. The reset poses are first-frame
+# joint angles from real demos (setting1: xarm_setting1_51/episode_000007,
+# setting2: xarm_setting2_51/episode_000014; each is the real episode start
+# closest to the 51-episode median). The previous shared reset pose
+# (J1=-87.9 deg) sits far outside the training proprio distribution
+# (setting1 first-frame J1 spans +25..+69 deg), so the model never saw the
+# post-reset observation. Keep prompt and reset pose selected by the same task.
+TASK_PRESETS = {
+    "setting1": {
+        "instruction": "put the red cube into the plastic cup",
+        "reset_position_deg": [53.44, -11.69, -54.41, -0.19, -35.42, -1.01],
+    },
+    "setting2": {
+        "instruction": "stack the red cup on top of the green cup",
+        "reset_position_deg": [36.20, 12.34, -43.52, -3.35, -60.06, 7.61],
+    },
+}
+
 DEFAULT_HARDWARE_PYTHON = "/home/zheyu/code/openpi_xarm/.venv/bin/python"
 
 MAX_POS_DELTA_MM = 200.0
@@ -607,11 +625,17 @@ def parse_args():
     parser = argparse.ArgumentParser(description="xArm6 + OpenVLA-OFT HTTP inference client")
     parser.add_argument("--xarm-ip", default="192.168.1.230", help="xArm IP address")
     parser.add_argument(
+        "--task",
+        choices=sorted(TASK_PRESETS),
+        default="setting1",
+        help="Task preset that provides the default instruction and reset pose.",
+    )
+    parser.add_argument(
         "--prompt",
         "--instruction",
         dest="prompt",
-        default="put the red cube into the plastic cup",
-        help="Raw task instruction, e.g. 'put the red cube into the plastic cup'. Do not include the OpenVLA 'In: ... Out:' wrapper.",
+        default=None,
+        help="Raw task instruction; defaults to the --task preset. Do not include the OpenVLA 'In: ... Out:' wrapper.",
     )
     parser.add_argument("--max-steps", type=int, default=30000)
     parser.add_argument("--action-hz", type=float, default=25.0)
@@ -651,7 +675,13 @@ def parse_args():
     parser.add_argument("--dry-run", action="store_true", help="Run inference and timing without moving the arm")
     parser.add_argument("--verbose-actions", action="store_true")
     parser.add_argument("--disable-keyboard-reset", action="store_true", help="Disable press-R reset to home pose")
-    parser.add_argument("--reset-position-deg", type=float, nargs=6, default=DEFAULT_RESET_POSITION_DEG)
+    parser.add_argument(
+        "--reset-position-deg",
+        type=float,
+        nargs=6,
+        default=None,
+        help="Joint angles (deg) for startup/press-R reset; defaults to the --task preset.",
+    )
     parser.add_argument("--reset-speed", type=float, default=30.0)
     parser.add_argument("--reset-pause", type=float, default=2.0)
 
@@ -668,6 +698,11 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
+    preset = TASK_PRESETS[args.task]
+    if args.prompt is None:
+        args.prompt = preset["instruction"]
+    if args.reset_position_deg is None:
+        args.reset_position_deg = list(preset["reset_position_deg"])
     args.prompt = normalize_prompt(args.prompt)
     warn_if_full_openvla_prompt(args.prompt)
 
@@ -735,7 +770,9 @@ def main() -> None:
         MAX_POS_DELTA_MM = args.max_delta_mm
         MAX_ROT_DELTA_RAD = args.max_delta_rad
 
+        print(f"Task preset: {args.task}")
         print(f"Task instruction: {args.prompt!r}")
+        print(f"Reset pose (deg): {args.reset_position_deg}")
         print(f"Connecting to OFT server at {endpoint}...")
         client = OFTActionClient(endpoint=endpoint, timeout=args.request_timeout)
 

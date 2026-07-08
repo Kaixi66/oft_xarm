@@ -3,8 +3,13 @@ set -euo pipefail
 
 CLIENT_PYTHON="${CLIENT_PYTHON:-/home/zheyu/code/openpi_xarm/.venv/bin/python}"
 # setting1: put the red cube into the plastic cup
-# paper setting2: stack the red cup on top of the green cup
-INSTRUCTION="${INSTRUCTION:-stack the red cup on top of the green cup}"
+# setting2 (paper): stack the red cup on top of the green cup
+# TASK selects the client preset (instruction + reset pose together, so they
+# cannot get out of sync). Set INSTRUCTION / RESET_POSITION_DEG to override.
+TASK="${TASK:-setting2}"
+INSTRUCTION="${INSTRUCTION:-}"
+# Six joint angles in degrees, e.g. "53.44 -11.69 -54.41 -0.19 -35.42 -1.01".
+RESET_POSITION_DEG="${RESET_POSITION_DEG:-}"
 ACTION_HZ="${ACTION_HZ:-25.0}"
 SERVO_HZ="${SERVO_HZ:-100.0}"
 NUM_OPEN_LOOP_STEPS="${NUM_OPEN_LOOP_STEPS:-25}"
@@ -30,10 +35,16 @@ fi
 
 cd "$(dirname "$0")"
 
+# serve_oft_xarm.sh uses paper_setting2 as an alias for the setting2 checkpoint.
+CLIENT_TASK="${TASK}"
+if [[ "${CLIENT_TASK}" == "paper_setting2" ]]; then
+    CLIENT_TASK="setting2"
+fi
+
 cmd=(
     "${CLIENT_PYTHON}"
     inference_oft_xarm.py
-    --instruction "${INSTRUCTION}"
+    --task "${CLIENT_TASK}"
     --action-hz "${ACTION_HZ}"
     --servo-hz "${SERVO_HZ}"
     --num-open-loop-steps "${NUM_OPEN_LOOP_STEPS}"
@@ -46,6 +57,15 @@ cmd=(
     --gripper-open-hold "${GRIPPER_OPEN_HOLD}"
     --gripper-close-hold "${GRIPPER_CLOSE_HOLD}"
 )
+
+if [[ -n "${INSTRUCTION}" ]]; then
+    cmd+=(--instruction "${INSTRUCTION}")
+fi
+
+if [[ -n "${RESET_POSITION_DEG}" ]]; then
+    # shellcheck disable=SC2206
+    cmd+=(--reset-position-deg ${RESET_POSITION_DEG})
+fi
 
 if [[ "${ASYNC_REQUERY,,}" == "true" ]]; then
     cmd+=(--async-requery)
