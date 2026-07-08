@@ -40,7 +40,9 @@ USE_VAL_SET="${USE_VAL_SET:-False}"
 VAL_FREQ="${VAL_FREQ:-2500}"
 VAL_TIME_LIMIT="${VAL_TIME_LIMIT:-180}"
 
-RUN_NAME="${RUN_NAME:-oft_setting2_paper}"
+# Leave empty to use the per-TASK default run name below. A hardcoded default
+# here would ignore TASK and make e.g. TASK=setting2 write into setting1's run.
+RUN_NAME="${RUN_NAME:-}"
 
 WANDB_ENTITY="${WANDB_ENTITY:-optimal-training-strategy}"
 WANDB_PROJECT="${WANDB_PROJECT:-RealWorld}"
@@ -71,17 +73,17 @@ case "${TASK}" in
     setting1)
         DEFAULT_DATA_ROOT_DIR="${REALWORLD_ROOT}/rlds_data_setting1"
         DEFAULT_EXP_PREFIX="xarm_setting1_oft"
-        DEFAULT_RUN_NAME="openvla-oft_setting1_proprio6_chunk25"
+        DEFAULT_RUN_NAME="oft_setting1_paper"
         ;;
     setting2)
         DEFAULT_DATA_ROOT_DIR="${REALWORLD_ROOT}/rlds_data_setting2"
         DEFAULT_EXP_PREFIX="xarm_setting2_oft"
-        DEFAULT_RUN_NAME="openvla-oft_setting2_proprio6_chunk25"
+        DEFAULT_RUN_NAME="oft_setting2_paper"
         ;;
     merged)
         DEFAULT_DATA_ROOT_DIR="${REALWORLD_ROOT}/rlds_data"
         DEFAULT_EXP_PREFIX="xarm_merged_oft"
-        DEFAULT_RUN_NAME="openvla-oft_merged_proprio6_chunk25"
+        DEFAULT_RUN_NAME="oft_merged_paper"
         ;;
     *)
         echo "[train_oft_realworld] TASK must be one of: setting1, setting2, merged" >&2

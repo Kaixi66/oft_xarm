@@ -61,20 +61,20 @@ TASK=setting2 ./train_oft_realworld.sh
 TASK=setting1 RUN_NAME=xarm_setting1_test01 ./train_oft_realworld.sh
 ```
 
-The default real-world run names are intentionally versioned for the current
-OFT setup:
+Without an explicit `RUN_NAME`, each `TASK` uses its own default run name:
 
 ```text
-openvla-oft_setting1_proprio6_chunk25
-openvla-oft_setting2_proprio6_chunk25
+oft_setting1_paper
+oft_setting2_paper
+oft_merged_paper
 ```
 
 After training, merge the LoRA checkpoint before serving:
 
 ```bash
 python /workspace/kaixi/RealWorld/merge_oft_lora_to_base.py \
-  --checkpoint-dir /workspace/kaixi/RealWorld/openvla_oft_runs/checkpoints/openvla-oft_setting1_proprio6_chunk25 \
-  --output-dir /workspace/kaixi/RealWorld/openvla_oft_runs/merged_public_checkpoints/openvla-oft_setting1_proprio6_chunk25
+  --checkpoint-dir /workspace/kaixi/RealWorld/openvla_oft_runs/checkpoints/oft_setting1_paper \
+  --output-dir /workspace/kaixi/RealWorld/openvla_oft_runs/merged_public_checkpoints/oft_setting1_paper
 ```
 
 Train OpenVLA-OFT with:
