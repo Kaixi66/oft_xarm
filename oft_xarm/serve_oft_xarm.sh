@@ -3,38 +3,11 @@ set -euo pipefail
 
 # OpenVLA-OFT xArm serving launcher. Serves a MERGED checkpoint via deploy.py.
 # Common usage:
-#   TASK=setting1 ./serve_oft_xarm.sh
-#   TASK=setting2 PORT=8778 ./serve_oft_xarm.sh
 #   CHECKPOINT=/path/to/merged_ckpt ./serve_oft_xarm.sh
-#   DRY_RUN=true TASK=setting1 ./serve_oft_xarm.sh
+#   USE_FILM=False OPENVLA_ROBOT_PLATFORM=XARM_LEGACY CHECKPOINT=/path/to/legacy_ckpt ./serve_oft_xarm.sh
+#   DRY_RUN=true ./serve_oft_xarm.sh
 
-#########################
-# User-facing settings
-#########################
-
-# setting1: cube -> plastic cup | setting2: cup stacking
-# The served model must match the physical scene AND the client --prompt.
-TASK="${TASK:-${SETTING:-setting2}}"
-
-# Merged checkpoint dir (must contain config.json + model safetensors).
-# Leave empty to use the TASK default under CHECKPOINT_ROOT.
-CHECKPOINT="${CHECKPOINT:-}"
-
-HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-8777}"
-
-# Model options — keep in sync with how the checkpoint was trained.
-USE_L1_REGRESSION="${USE_L1_REGRESSION:-True}"
-USE_DIFFUSION="${USE_DIFFUSION:-False}"
-USE_FILM="${USE_FILM:-}"
-NUM_IMAGES_IN_INPUT="${NUM_IMAGES_IN_INPUT:-2}"
-USE_PROPRIO="${USE_PROPRIO:-True}"
-CENTER_CROP="${CENTER_CROP:-True}"
-LOAD_IN_8BIT="${LOAD_IN_8BIT:-False}"
-LOAD_IN_4BIT="${LOAD_IN_4BIT:-False}"
-UNNORM_KEY="${UNNORM_KEY:-utokyo_xarm_pick_and_place_converted_externally_to_rlds}"
-
-DRY_RUN="${DRY_RUN:-false}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 #################
 # Internal wiring
@@ -46,29 +19,37 @@ CONDA_ENV="${CONDA_ENV:-/home/zheyu/miniforge3/envs/openvla-oft-thor}"
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/home/zheyu/kaixi/RealWorld-OFT-merged-checkpoints}"
 PYTHON="${PYTHON:-${CONDA_ENV}/bin/python}"
 
-case "${TASK}" in
-    setting1)
-        DEFAULT_CHECKPOINT="${CHECKPOINT_ROOT}/openvla-oft_setting1"
-        DEFAULT_USE_FILM="False"
-        EXAMPLE_PROMPT="put the red cube into the plastic cup"
-        ;;
-    setting2|paper_setting2)
-        DEFAULT_CHECKPOINT="${CHECKPOINT_ROOT}/AAyano_oft_setting2_stacking_paper_10k"
-        DEFAULT_USE_FILM="True"
-        EXAMPLE_PROMPT="stack the red cup on top of the green cup"
-        ;;
-    setting2_legacy)
-        DEFAULT_CHECKPOINT="${CHECKPOINT_ROOT}/openvla-oft_setting2"
-        DEFAULT_USE_FILM="False"
-        EXAMPLE_PROMPT="stack the red cup on top of the green cup"
-        ;;
-    *)
-        echo "[serve_oft_xarm] TASK must be setting1, setting2, paper_setting2, or setting2_legacy" >&2
-        exit 2
-        ;;
-esac
-CHECKPOINT="${CHECKPOINT:-${DEFAULT_CHECKPOINT}}"
-USE_FILM="${USE_FILM:-${DEFAULT_USE_FILM}}"
+#########################
+# User-facing settings
+#########################
+
+# Direct model interface. This default is the latest setting2 30k checkpoint.
+CHECKPOINT="${CHECKPOINT:-${CHECKPOINT_ROOT}/AAyano_oft_setting2_chunksize25_batch32_30k}"
+
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8777}"
+
+# Model options — keep these explicit and in sync with the selected checkpoint.
+USE_L1_REGRESSION="${USE_L1_REGRESSION:-True}"
+USE_DIFFUSION="${USE_DIFFUSION:-False}"
+USE_FILM="${USE_FILM:-True}"
+NUM_IMAGES_IN_INPUT="${NUM_IMAGES_IN_INPUT:-2}"
+USE_PROPRIO="${USE_PROPRIO:-True}"
+CENTER_CROP="${CENTER_CROP:-True}"
+LOAD_IN_8BIT="${LOAD_IN_8BIT:-False}"
+LOAD_IN_4BIT="${LOAD_IN_4BIT:-False}"
+UNNORM_KEY="${UNNORM_KEY:-utokyo_xarm_pick_and_place_converted_externally_to_rlds}"
+OPENVLA_ROBOT_PLATFORM="${OPENVLA_ROBOT_PLATFORM:-XARM}"
+
+DRY_RUN="${DRY_RUN:-false}"
+SERVER_LOG_FILE="${SERVER_LOG_FILE:-${SCRIPT_DIR}/serve_oft.log}"
+TEE_SERVER_LOG="${TEE_SERVER_LOG:-true}"
+
+if [[ "${TEE_SERVER_LOG,,}" == "true" ]]; then
+    mkdir -p "$(dirname "${SERVER_LOG_FILE}")"
+    export PYTHONUNBUFFERED=1
+    exec > >(tee "${SERVER_LOG_FILE}") 2>&1
+fi
 
 if [[ ! -x "${PYTHON}" ]]; then
     echo "[serve_oft_xarm] missing python: ${PYTHON}" >&2
@@ -89,8 +70,6 @@ required_checkpoint_files=(
     "config.json"
     "dataset_statistics.json"
     "model.safetensors.index.json"
-    "action_head--latest_checkpoint.pt"
-    "proprio_projector--latest_checkpoint.pt"
 )
 
 for required_file in "${required_checkpoint_files[@]}"; do
@@ -98,6 +77,18 @@ for required_file in "${required_checkpoint_files[@]}"; do
         echo "[serve_oft_xarm] checkpoint missing ${required_file}: ${CHECKPOINT}" >&2
         echo "[serve_oft_xarm] merge the LoRA run first:" >&2
         echo "  ${PYTHON} ${REALWORLD_ROOT}/merge_oft_lora_to_base.py --checkpoint-dir <lora_run_dir> --output-dir <merged_dir>" >&2
+        exit 1
+    fi
+done
+
+required_checkpoint_patterns=(
+    "action_head--*_checkpoint.pt"
+    "proprio_projector--*_checkpoint.pt"
+)
+
+for required_pattern in "${required_checkpoint_patterns[@]}"; do
+    if ! compgen -G "${CHECKPOINT}/${required_pattern}" > /dev/null; then
+        echo "[serve_oft_xarm] checkpoint missing ${required_pattern}: ${CHECKPOINT}" >&2
         exit 1
     fi
 done
@@ -143,6 +134,7 @@ export TOKENIZERS_PARALLELISM=false
 export PATH="/usr/local/cuda/bin:${PATH}"
 export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-/usr/local/cuda/bin/ptxas}"
 export TORCHDYNAMO_DISABLE="${TORCHDYNAMO_DISABLE:-1}"
+export OPENVLA_ROBOT_PLATFORM
 
 cmd=(
     "${PYTHON}"
@@ -164,17 +156,16 @@ cmd=(
 echo "============================================"
 echo "  OpenVLA-OFT xArm Server"
 echo "============================================"
-echo "  task:       ${TASK}"
 echo "  repo:       ${REPO_DIR}"
 echo "  python:     ${PYTHON}"
 echo "  checkpoint: ${CHECKPOINT}"
 echo "  endpoint:   http://${HOST}:${PORT}/act"
 echo "  unnorm_key: ${UNNORM_KEY}"
+echo "  platform:   ${OPENVLA_ROBOT_PLATFORM}"
 echo "  use_film:   ${USE_FILM}"
 echo "  images:     ${NUM_IMAGES_IN_INPUT}"
 echo "  proprio:    ${USE_PROPRIO}"
-echo "  prompt e.g. \"${EXAMPLE_PROMPT}\""
-echo "  (client --prompt must be one of this task's training instructions)"
+echo "  log_file:   ${SERVER_LOG_FILE}"
 echo "============================================"
 printf '[serve_oft_xarm] command:'
 printf ' %q' "${cmd[@]}"

@@ -12,9 +12,11 @@ __pycache__/
 
 # Logs and temporary files
 *.log
+*.logs
 nohup.out
 .DS_Store
 debug_images/
+OBS/
 
 # Optional local copies from external repos
 openpi_xarm_git-main/

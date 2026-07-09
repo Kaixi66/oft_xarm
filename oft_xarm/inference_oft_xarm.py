@@ -67,6 +67,10 @@ TASK_PRESETS = {
         "reset_position_deg": [53.44, -11.69, -54.41, -0.19, -35.42, -1.01],
     },
     "setting2": {
+        "instruction": "stack the blue cup on top of the red cup",
+        "reset_position_deg": [36.20, 12.34, -43.52, -3.35, -60.06, 7.61],
+    },
+    "setting2_legacy": {
         "instruction": "stack the red cup on top of the green cup",
         "reset_position_deg": [36.20, 12.34, -43.52, -3.35, -60.06, 7.61],
     },
@@ -236,18 +240,20 @@ class OFTActionClient:
 
 
 def get_xarm_state_cached(arm: XArmAPI, proprio_dim: int) -> np.ndarray:
-    """Read the 6 xArm joint angles in radians."""
-    if proprio_dim != 6:
+    """Read xArm joint angles in radians; legacy OFT pads the 6 joints to 8D."""
+    if proprio_dim not in (6, 8):
         raise ValueError(
-            f"xArm OFT proprio is 6-dim without padding; got --proprio-dim {proprio_dim}. "
-            "Use a checkpoint trained with PROPRIO_DIM=6."
+            f"xArm OFT proprio must be 6D or legacy padded 8D; got --proprio-dim {proprio_dim}."
         )
 
     angles_deg = arm.angles
     if angles_deg is None:
         raise RuntimeError("arm.angles returned None (report stream not ready?)")
 
-    return np.asarray(angles_deg[:6], dtype=np.float32) * DEG2RAD
+    state = np.asarray(angles_deg[:6], dtype=np.float32) * DEG2RAD
+    if proprio_dim == 8:
+        state = np.concatenate([state, np.zeros(2, dtype=np.float32)])
+    return state
 
 
 def crop_and_resize(
@@ -310,6 +316,7 @@ class AsyncInferenceWorker:
         external_crop: str,
         debug_image_dir: str,
         debug_image_every: int,
+        log_action_chunks: bool,
     ):
         self.client = client
         self.cam_wrist = cam_wrist
@@ -323,6 +330,8 @@ class AsyncInferenceWorker:
         self.external_crop = external_crop
         self.debug_image_dir = Path(debug_image_dir).expanduser() if debug_image_dir else None
         self.debug_image_every = max(1, debug_image_every)
+        self.log_action_chunks = log_action_chunks
+        self._previous_action_chunk = None
         self._debug_capture_count = 0
         if self.debug_image_dir is not None:
             self.debug_image_dir.mkdir(parents=True, exist_ok=True)
@@ -379,6 +388,28 @@ class AsyncInferenceWorker:
             img_wrist,
         )
 
+    def _log_action_chunk(self, actions: np.ndarray, state: np.ndarray) -> None:
+        if not self.log_action_chunks:
+            return
+
+        chunk = np.asarray(actions, dtype=np.float64)
+        summary_parts = [
+            f"first={np.array2string(chunk[0], precision=4, suppress_small=False)}",
+            f"mean={np.array2string(chunk.mean(axis=0), precision=4, suppress_small=False)}",
+            f"std={np.array2string(chunk.std(axis=0), precision=4, suppress_small=False)}",
+            f"state={np.array2string(state, precision=4, suppress_small=False)}",
+        ]
+
+        if self._previous_action_chunk is not None and self._previous_action_chunk.shape == chunk.shape:
+            delta = np.abs(chunk - self._previous_action_chunk)
+            summary_parts.append(f"diff_prev_mean={delta.mean():.5f}")
+            summary_parts.append(f"diff_prev_max={delta.max():.5f}")
+        else:
+            summary_parts.append("diff_prev=NA")
+
+        self._previous_action_chunk = chunk.copy()
+        print("  ACTION CHUNK | " + " | ".join(summary_parts), flush=True)
+
     def _infer_once(self, state: np.ndarray) -> np.ndarray:
         t0 = time.time()
         fut_w = self._cam_pool.submit(self._capture_wrist)
@@ -398,6 +429,7 @@ class AsyncInferenceWorker:
         t0 = time.time()
         actions = self.client.infer(observation)
         self.last_infer_ms = (time.time() - t0) * 1000
+        self._log_action_chunk(actions, state)
         return actions
 
     def run_first_sync(self):
@@ -506,16 +538,36 @@ class AsyncInferenceWorker:
         self._cam_pool.shutdown(wait=False)
 
 
-def servo_hold(arm: XArmAPI, tracked_pose: np.ndarray, servo_dt: float, duration: float) -> None:
+def interruptible_sleep(duration: float, should_stop=None, poll_dt: float = 0.02) -> bool:
+    end_time = time.perf_counter() + duration
+    while time.perf_counter() < end_time:
+        if should_stop is not None and should_stop():
+            return True
+        remaining = end_time - time.perf_counter()
+        if remaining > 0:
+            time.sleep(min(poll_dt, remaining))
+    return False
+
+
+def servo_hold(
+    arm: XArmAPI,
+    tracked_pose: np.ndarray,
+    servo_dt: float,
+    duration: float,
+    should_stop=None,
+) -> bool:
     pose_list = tracked_pose.tolist()
     end_time = time.perf_counter() + duration
     while time.perf_counter() < end_time:
+        if should_stop is not None and should_stop():
+            return True
         t_h = time.perf_counter()
         arm.set_servo_cartesian(pose_list, is_radian=True)
         elapsed = time.perf_counter() - t_h
         remaining = servo_dt - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
+        if remaining > 0 and interruptible_sleep(remaining, should_stop):
+            return True
+    return False
 
 
 def init_gripper(arm: XArmAPI, open_pos: int, speed: int) -> float:
@@ -548,15 +600,18 @@ def reset_to_home(
     *,
     reset_speed: float,
     reset_pause: float,
+    reset_timeout: float,
+    reset_gripper_pos: int | None,
     servo_dt: float,
     dry_run: bool,
     async_requery: bool,
     gripper_enabled: bool,
     gripper_open_pos: int,
     gripper_speed: int,
+    reason: str = "reset requested",
 ) -> np.ndarray:
     """Move to the configured reset joint pose and return a re-synced TCP pose."""
-    print("\n  [RESET] 'R' pressed: stopping policy actions and moving to reset pose...")
+    print(f"\n  [RESET] {reason}: stopping policy actions and moving to reset pose...")
 
     if async_requery:
         worker.stop()
@@ -578,24 +633,40 @@ def reset_to_home(
     if dry_run:
         print(f"  [RESET] dry-run: would move joints to {reset_angles_deg}")
     else:
+        arm.clean_error()
+        arm.clean_warn()
+        arm.motion_enable(enable=True)
         arm.set_mode(0)
         arm.set_state(0)
         time.sleep(0.5)
-        code = arm.set_servo_angle(angle=reset_angles_deg, speed=reset_speed, is_radian=False, wait=True)
+        code = arm.set_servo_angle(
+            angle=reset_angles_deg,
+            speed=reset_speed,
+            is_radian=False,
+            wait=True,
+            timeout=reset_timeout,
+        )
         if code != 0:
-            raise RuntimeError(f"set_servo_angle reset failed: code={code}")
+            try:
+                err_warn = arm.get_err_warn_code()
+            except Exception:
+                err_warn = None
+            raise RuntimeError(
+                "set_servo_angle reset failed: "
+                f"code={code}, arm_error={arm.error_code}, arm_state={arm.state}, err_warn={err_warn}"
+            )
         print(f"  [RESET] Reached reset joint pose: {reset_angles_deg}")
+
+        if reset_gripper_pos is not None:
+            arm.set_gripper_position(reset_gripper_pos, wait=True)
+            print(f"  [RESET] Reset gripper position: {reset_gripper_pos}")
+
+    if dry_run and reset_gripper_pos is not None:
+        print(f"  [RESET] dry-run: would move gripper to {reset_gripper_pos}")
 
     if reset_pause > 0:
         print(f"  [RESET] Pausing {reset_pause:.1f}s...")
-        if dry_run:
-            time.sleep(reset_pause)
-        else:
-            code, pose = arm.get_position(is_radian=True)
-            if code == 0:
-                servo_hold(arm, np.array(pose[:6], dtype=np.float64), servo_dt, reset_pause)
-            else:
-                time.sleep(reset_pause)
+        time.sleep(reset_pause)
 
     code, new_pose = arm.get_position(is_radian=True)
     if code != 0:
@@ -640,16 +711,16 @@ def parse_args():
     parser.add_argument("--xarm-ip", default="192.168.1.230", help="xArm IP address")
     parser.add_argument(
         "--task",
-        choices=sorted(TASK_PRESETS),
-        default="setting1",
-        help="Task preset that provides the default instruction and reset pose.",
+        choices=["custom", *sorted(TASK_PRESETS)],
+        default="custom",
+        help="Optional preset for default instruction/reset pose. Use custom for explicit --instruction and --reset-position-deg.",
     )
     parser.add_argument(
         "--prompt",
         "--instruction",
         dest="prompt",
         default=None,
-        help="Raw task instruction; defaults to the --task preset. Do not include the OpenVLA 'In: ... Out:' wrapper.",
+        help="Raw task instruction. Do not include the OpenVLA 'In: ... Out:' wrapper.",
     )
     parser.add_argument("--max-steps", type=int, default=30000)
     parser.add_argument("--action-hz", type=float, default=25.0)
@@ -663,7 +734,7 @@ def parse_args():
     parser.add_argument("--server-url", default="", help="Full OFT /act URL; overrides host/port")
     parser.add_argument("--request-timeout", type=float, default=120.0)
 
-    parser.add_argument("--proprio-dim", type=int, default=6, help="xArm OFT proprio dimension; must be 6")
+    parser.add_argument("--proprio-dim", type=int, default=6, help="xArm OFT proprio dimension; use 6 or legacy padded 8")
     parser.add_argument("--external-cam-serial", default=DEFAULT_EXTERNAL_CAM_SERIAL)
     parser.add_argument("--wrist-cam-serial", default=DEFAULT_WRIST_CAM_SERIAL)
     parser.add_argument("--camera-width", type=int, default=1920)
@@ -688,16 +759,33 @@ def parse_args():
     parser.add_argument("--max-delta-rad", type=float, default=1.0)
     parser.add_argument("--dry-run", action="store_true", help="Run inference and timing without moving the arm")
     parser.add_argument("--verbose-actions", action="store_true")
+    parser.add_argument(
+        "--log-action-chunks",
+        action="store_true",
+        help="Log each model action chunk summary, including change from the previous chunk.",
+    )
     parser.add_argument("--disable-keyboard-reset", action="store_true", help="Disable press-R reset to home pose")
     parser.add_argument(
         "--reset-position-deg",
         type=float,
         nargs=6,
         default=None,
-        help="Joint angles (deg) for startup/press-R reset; defaults to the --task preset.",
+        help="Joint angles (deg) for startup/press-R reset.",
     )
     parser.add_argument("--reset-speed", type=float, default=30.0)
     parser.add_argument("--reset-pause", type=float, default=2.0)
+    parser.add_argument("--reset-timeout", type=float, default=15.0)
+    parser.add_argument(
+        "--reset-gripper-pos",
+        type=int,
+        default=None,
+        help="If set and gripper is enabled, move gripper to this position on reset.",
+    )
+    parser.add_argument(
+        "--reset-trigger-file",
+        default="/tmp/oft_xarm_reset",
+        help="If this file appears during inference, delete it and reset the arm. Set empty string to disable.",
+    )
 
     parser.add_argument("--disable-gripper", action="store_true", help="Ignore action[6] and do not command gripper")
     parser.add_argument(
@@ -716,10 +804,14 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
-    preset = TASK_PRESETS[args.task]
+    preset = TASK_PRESETS.get(args.task)
     if args.prompt is None:
+        if preset is None:
+            raise ValueError("--instruction is required when --task custom")
         args.prompt = preset["instruction"]
     if args.reset_position_deg is None:
+        if preset is None:
+            raise ValueError("--reset-position-deg is required when --task custom")
         args.reset_position_deg = list(preset["reset_position_deg"])
     args.prompt = normalize_prompt(args.prompt)
     warn_if_full_openvla_prompt(args.prompt)
@@ -856,6 +948,7 @@ def main() -> None:
             external_crop=args.external_crop,
             debug_image_dir=args.debug_image_dir,
             debug_image_every=args.debug_image_every,
+            log_action_chunks=args.log_action_chunks,
         )
 
         print("Running first inference (sync, in mode 0)...")
@@ -874,10 +967,56 @@ def main() -> None:
         key_listener.start()
         if key_listener.enabled:
             print("  Press 'R' to reset arm to the configured joint pose.\n")
+        reset_trigger_path = Path(args.reset_trigger_file).expanduser() if args.reset_trigger_file else None
+        if reset_trigger_path is not None:
+            if reset_trigger_path.exists():
+                try:
+                    reset_trigger_path.unlink()
+                    print(f"  Removed stale reset trigger file: {reset_trigger_path}")
+                except OSError as exc:
+                    print(f"  WARNING: could not remove stale reset trigger file {reset_trigger_path}: {exc}")
+            print(f"  Or run this in another terminal to reset: touch {reset_trigger_path}\n")
 
         move_ok = 0
         hold_steps = 0
         reset_count = 0
+
+        def reset_requested() -> tuple[bool, str]:
+            if key_listener is not None and key_listener.check_and_clear():
+                return True, "'R' pressed"
+            if reset_trigger_path is not None and reset_trigger_path.exists():
+                try:
+                    reset_trigger_path.unlink()
+                except OSError:
+                    pass
+                return True, f"trigger file {reset_trigger_path}"
+            return False, ""
+
+        def perform_reset(step_idx: int, reason: str) -> None:
+            nonlocal tracked_pose, reset_count, current_gripper_state
+            reset_count += 1
+            tracked_pose = reset_to_home(
+                arm,
+                worker,
+                list(args.reset_position_deg),
+                reset_speed=args.reset_speed,
+                reset_pause=args.reset_pause,
+                reset_timeout=args.reset_timeout,
+                reset_gripper_pos=args.reset_gripper_pos if gripper_enabled else None,
+                servo_dt=servo_dt,
+                dry_run=args.dry_run,
+                async_requery=args.async_requery,
+                gripper_enabled=gripper_enabled,
+                gripper_open_pos=args.gripper_open_pos,
+                gripper_speed=args.gripper_init_speed,
+                reason=reason,
+            )
+            if gripper_enabled:
+                if args.reset_gripper_pos is not None:
+                    current_gripper_state = 1.0 if args.reset_gripper_pos < 400 else -1.0
+                else:
+                    current_gripper_state = -1.0
+            print(f"  Reset #{reset_count} complete. Continuing from step {step_idx}.")
 
         print("\nStarting control loop (OpenVLA-OFT):")
         print(f"  action_hz={args.action_hz}, servo_hz={args.servo_hz}")
@@ -899,24 +1038,9 @@ def main() -> None:
         for step in range(args.max_steps):
             t_step_start = time.perf_counter()
 
-            if key_listener is not None and key_listener.check_and_clear():
-                reset_count += 1
-                tracked_pose = reset_to_home(
-                    arm,
-                    worker,
-                    list(args.reset_position_deg),
-                    reset_speed=args.reset_speed,
-                    reset_pause=args.reset_pause,
-                    servo_dt=servo_dt,
-                    dry_run=args.dry_run,
-                    async_requery=args.async_requery,
-                    gripper_enabled=gripper_enabled,
-                    gripper_open_pos=args.gripper_open_pos,
-                    gripper_speed=args.gripper_init_speed,
-                )
-                if gripper_enabled:
-                    current_gripper_state = -1.0
-                print(f"  Reset #{reset_count} complete. Continuing from step {step}.")
+            do_reset, reset_reason = reset_requested()
+            if do_reset:
+                perform_reset(step, reset_reason)
                 continue
 
             if not args.dry_run and (arm.error_code != 0 or arm.state == 4):
@@ -944,9 +1068,12 @@ def main() -> None:
             if action is None:
                 if args.async_requery:
                     if args.dry_run:
-                        time.sleep(action_dt)
+                        do_reset = interruptible_sleep(action_dt, lambda: reset_requested()[0])
                     else:
-                        servo_hold(arm, tracked_pose, servo_dt, action_dt)
+                        do_reset = servo_hold(arm, tracked_pose, servo_dt, action_dt, lambda: reset_requested()[0])
+                    if do_reset:
+                        perform_reset(step, "reset requested during hold")
+                        continue
                     hold_steps += 1
                     print(f"  Step {step:03d} | HOLD (queue empty) | total_holds={hold_steps}")
                     continue
@@ -982,7 +1109,9 @@ def main() -> None:
                     gripper_text = "close" if gripper_cmd > 0 else "open"
                     print(f"  [{step}] dry-run gripper trigger: {gripper_text}")
                     current_gripper_state = gripper_cmd
-                time.sleep(action_dt)
+                if interruptible_sleep(action_dt, lambda: reset_requested()[0]):
+                    perform_reset(step, "reset requested during dry-run step")
+                    continue
             else:
                 if gripper_trigger:
                     if gripper_cmd > 0:
@@ -995,9 +1124,16 @@ def main() -> None:
                         arm.set_gripper_position(args.gripper_open_pos, wait=False)
                         hold_dur = args.gripper_open_hold
 
-                    if hold_dur > 0:
-                        servo_hold(arm, tracked_pose, servo_dt, hold_dur)
                     current_gripper_state = gripper_cmd
+                    if hold_dur > 0 and servo_hold(
+                        arm,
+                        tracked_pose,
+                        servo_dt,
+                        hold_dur,
+                        lambda: reset_requested()[0],
+                    ):
+                        perform_reset(step, "reset requested during gripper hold")
+                        continue
 
                     if args.async_requery:
                         stale = flush_action_queue(worker)
@@ -1018,16 +1154,25 @@ def main() -> None:
                 sub_pos = pos_delta / substeps
                 sub_rot = rot_delta / substeps
 
+                reset_during_action = False
                 for _ in range(substeps):
+                    do_reset, reset_reason = reset_requested()
+                    if do_reset:
+                        reset_during_action = True
+                        break
                     t_sub = time.perf_counter()
                     tracked_pose[:3] += sub_pos
                     tracked_pose[3:6] += sub_rot
                     arm.set_servo_cartesian(tracked_pose.tolist(), is_radian=True)
 
                     remaining = servo_dt - (time.perf_counter() - t_sub)
-                    if remaining > 0:
-                        time.sleep(remaining)
+                    if remaining > 0 and interruptible_sleep(remaining, lambda: reset_requested()[0]):
+                        reset_during_action = True
+                        break
 
+                if reset_during_action:
+                    perform_reset(step, "reset requested during action")
+                    continue
                 move_ok += 1
 
             t_act = time.perf_counter() - t0
