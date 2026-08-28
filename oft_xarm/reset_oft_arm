@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Keep these defaults identical to run_inference_oft_xarm.sh.
+CLIENT_PYTHON="${CLIENT_PYTHON:-/home/zheyu/code/openpi_xarm/.venv/bin/python}"
+PAIR_XARM_DIR="${PAIR_XARM_DIR:-/home/zheyu/kaixi/PAIR_xarm}"
+XARM_IP="${XARM_IP:-192.168.1.230}"
+RESET_POSITION_DEG="${RESET_POSITION_DEG:-55.399232 7.733498 -48.980042 -1.039517 -57.38115 -0.614669}"
+RESET_SPEED="${RESET_SPEED:-20}"
+RESET_TIMEOUT="${RESET_TIMEOUT:-30}"
+RESET_PAUSE="${RESET_PAUSE:-2}"
+RESET_TRIGGER_FILE="${RESET_TRIGGER_FILE:-/tmp/oft_xarm_reset}"
+GRIPPER_OPEN_POS="${GRIPPER_OPEN_POS:-850}"
+GRIPPER_SPEED="${GRIPPER_SPEED:-1000}"
+
+# When inference is alive, it owns the SDK connection. Request reset through
+# its trigger file instead of opening a second connection to the same arm.
+client_pattern="${SCRIPT_DIR}/inference_oft_xarm.py"
+if pgrep -u "$(id -u)" -f "${client_pattern}" >/dev/null 2>&1; then
+    mkdir -p "$(dirname "${RESET_TRIGGER_FILE}")"
+    touch "${RESET_TRIGGER_FILE}"
+    printf 'OFT reset requested through the running inference client.\n'
+    printf 'Watch the inference terminal for: [RESET] stopping policy actions.\n'
+    exit 0
+fi
+
+# With no inference client, use PAIR's guarded standalone reset implementation.
+[[ -x "${CLIENT_PYTHON}" ]] || { echo "Missing client Python: ${CLIENT_PYTHON}" >&2; exit 2; }
+[[ -f "${PAIR_XARM_DIR}/pair_xarm/reset_pair_arm.py" ]] || {
+    echo "Missing PAIR reset implementation: ${PAIR_XARM_DIR}/pair_xarm/reset_pair_arm.py" >&2
+    exit 2
+}
+read -r -a reset_args <<< "${RESET_POSITION_DEG}"
+[[ "${#reset_args[@]}" -eq 6 ]] || { echo "RESET_POSITION_DEG must have six values" >&2; exit 2; }
+
+export PYTHONPATH="${PAIR_XARM_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+printf 'No OFT inference client is running; starting standalone UF850 reset.\n'
+exec "${CLIENT_PYTHON}" -m pair_xarm.reset_pair_arm \
+    --xarm-ip "${XARM_IP}" \
+    --reset-position-deg "${reset_args[@]}" \
+    --reset-speed "${RESET_SPEED}" \
+    --reset-timeout "${RESET_TIMEOUT}" \
+    --reset-pause "${RESET_PAUSE}" \
+    --open-gripper \
+    --gripper-open-pos "${GRIPPER_OPEN_POS}" \
+    --gripper-speed "${GRIPPER_SPEED}"

@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# OpenVLA-OFT xArm serving launcher. Serves a MERGED checkpoint via deploy.py.
-# Common usage:
-#   CHECKPOINT=/path/to/merged_ckpt ./serve_oft_xarm.sh
-#   USE_FILM=False OPENVLA_ROBOT_PLATFORM=XARM_LEGACY CHECKPOINT=/path/to/legacy_ckpt ./serve_oft_xarm.sh
-#   DRY_RUN=true ./serve_oft_xarm.sh
+# OpenVLA-OFT UF850 serving launcher. Edit only OFT_TASK_SELECTION for normal
+# use; the matching checkpoint is selected automatically.
+
+###############################################################################
+# TASK SELECTION
+#
+# Available values:
+#   put-blue-bowl-in-second-drawer
+#   erase-circle-from-whiteboard
+OFT_TASK_SELECTION="put-blue-bowl-in-second-drawer"
+###############################################################################
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -14,17 +20,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #################
 
 REALWORLD_ROOT="${REALWORLD_ROOT:-/home/zheyu/kaixi/RealWorld}"
-REPO_DIR="${REPO_DIR:-/home/zheyu/0517_lab_xarm/openvla-oft}"
+REPO_DIR="${REPO_DIR:-/home/zheyu/kaixi/openvla-oft}"
 CONDA_ENV="${CONDA_ENV:-/home/zheyu/miniforge3/envs/openvla-oft-thor}"
-CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/home/zheyu/kaixi/RealWorld-OFT-merged-checkpoints}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-/home/zheyu/kaixi/OFT-UF850-checkpoints}"
 PYTHON="${PYTHON:-${CONDA_ENV}/bin/python}"
 
 #########################
 # User-facing settings
 #########################
 
-# Direct model interface. This default is the latest setting2 30k checkpoint.
-CHECKPOINT="${CHECKPOINT:-${CHECKPOINT_ROOT}/AAyano_oft_setting2_chunksize25_batch32_30k}"
+OFT_TASK="${OFT_TASK_OVERRIDE:-${OFT_TASK_SELECTION}}"
+case "${OFT_TASK}" in
+    put-blue-bowl-in-second-drawer)
+        TASK_CHECKPOINT="${CHECKPOINT_ROOT}/put-blue-bowl-in-second-drawer-10k"
+        ;;
+    erase-circle-from-whiteboard)
+        TASK_CHECKPOINT="${CHECKPOINT_ROOT}/erase-circle-from-whiteboard-30k"
+        ;;
+    *)
+        echo "[serve_oft_xarm] unsupported OFT_TASK=${OFT_TASK}" >&2
+        exit 2
+        ;;
+esac
+CHECKPOINT="${CHECKPOINT:-${TASK_CHECKPOINT}}"
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8777}"
@@ -42,8 +60,9 @@ UNNORM_KEY="${UNNORM_KEY:-utokyo_xarm_pick_and_place_converted_externally_to_rld
 OPENVLA_ROBOT_PLATFORM="${OPENVLA_ROBOT_PLATFORM:-XARM}"
 
 DRY_RUN="${DRY_RUN:-false}"
-SERVER_LOG_FILE="${SERVER_LOG_FILE:-${SCRIPT_DIR}/serve_oft.log}"
+SERVER_LOG_FILE="${SERVER_LOG_FILE:-${SCRIPT_DIR}/serve_oft_${OFT_TASK}.log}"
 TEE_SERVER_LOG="${TEE_SERVER_LOG:-true}"
+ACTIVE_TASK_FILE="${ACTIVE_TASK_FILE:-${SCRIPT_DIR}/.runtime/active_oft_task.env}"
 
 if [[ "${TEE_SERVER_LOG,,}" == "true" ]]; then
     mkdir -p "$(dirname "${SERVER_LOG_FILE}")"
@@ -158,6 +177,7 @@ echo "  OpenVLA-OFT xArm Server"
 echo "============================================"
 echo "  repo:       ${REPO_DIR}"
 echo "  python:     ${PYTHON}"
+echo "  task:       ${OFT_TASK}"
 echo "  checkpoint: ${CHECKPOINT}"
 echo "  endpoint:   http://${HOST}:${PORT}/act"
 echo "  unnorm_key: ${UNNORM_KEY}"
@@ -165,6 +185,7 @@ echo "  platform:   ${OPENVLA_ROBOT_PLATFORM}"
 echo "  use_film:   ${USE_FILM}"
 echo "  images:     ${NUM_IMAGES_IN_INPUT}"
 echo "  proprio:    ${USE_PROPRIO}"
+echo "  model_chunk: 25 (client executes 8 per query)"
 echo "  log_file:   ${SERVER_LOG_FILE}"
 echo "============================================"
 printf '[serve_oft_xarm] command:'
@@ -174,5 +195,13 @@ printf '\n'
 if [[ "${DRY_RUN,,}" == "true" ]]; then
     exit 0
 fi
+
+mkdir -p "$(dirname "${ACTIVE_TASK_FILE}")"
+active_task_tmp="${ACTIVE_TASK_FILE}.tmp.$$"
+{
+    printf 'OFT_TASK=%q\n' "${OFT_TASK}"
+    printf 'OFT_CHECKPOINT=%q\n' "${CHECKPOINT}"
+} > "${active_task_tmp}"
+mv "${active_task_tmp}" "${ACTIVE_TASK_FILE}"
 
 exec "${cmd[@]}"

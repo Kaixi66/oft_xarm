@@ -17,6 +17,8 @@ nohup.out
 .DS_Store
 debug_images/
 OBS/
+oft_xarm/.runtime/
+oft_xarm/outputs/
 
 # Optional local copies from external repos
 openpi_xarm_git-main/

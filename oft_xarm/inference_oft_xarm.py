@@ -4,7 +4,7 @@
 This script reuses the lab xArm hardware loop:
 - two RealSense RGB streams
 - 6-dim xArm joint state in radians
-- 25-step open-loop action chunks by default
+- 8-step open-loop action chunks at 10 Hz
 - interpolated Cartesian servo execution for each action
 - basic gripper control from action[6]
 
@@ -14,6 +14,7 @@ action[6] is binarized: positive closes the xArm gripper, non-positive opens it.
 
 import argparse
 import collections
+import json
 import os
 import select
 import signal
@@ -54,25 +55,39 @@ except ImportError:
 DEFAULT_EXTERNAL_CAM_SERIAL = "215222078407"
 DEFAULT_WRIST_CAM_SERIAL = "845112070404"
 
-# Per-task instruction and press-R reset pose. The reset poses are first-frame
-# joint angles from real demos (setting1: xarm_setting1_51/episode_000007,
-# setting2: xarm_setting2_51/episode_000014; each is the real episode start
-# closest to the 51-episode median). The previous shared reset pose
-# (J1=-87.9 deg) sits far outside the training proprio distribution
-# (setting1 first-frame J1 spans +25..+69 deg), so the model never saw the
-# post-reset observation. Keep prompt and reset pose selected by the same task.
+# The two supported task datasets were collected at 960x540 and converted to RLDS with
+# these exact square crops before resizing to 224x224. Keep these values in
+# sync with the CASE-Lab conversion manifests; using the old 1920x1080 crop
+# modes silently feeds the model a different view.
+TRAIN_CAMERA_WIDTH = 960
+TRAIN_CAMERA_HEIGHT = 540
+TRAIN_CAMERA_FPS = 60
+TRAIN_CROP_SIZE = 540
+TRAIN_EXTERNAL_CROP_LEFT = 270  # cam_1: [270, 0, 810, 540]
+TRAIN_WRIST_CROP_LEFT = 380     # cam_0: [380, 0, 920, 540]
+POLICY_IMAGE_SIZE = 224
+
+# Per-task instruction, duration cap, and press-R reset pose. Both available
+# tasks use the proven UF850 collection reset pose and start with the gripper
+# open.
+COLLECTION_RESET_POSITION_DEG = [
+    55.399232,
+    7.733498,
+    -48.980042,
+    -1.039517,
+    -57.38115,
+    -0.614669,
+]
 TASK_PRESETS = {
-    "setting1": {
-        "instruction": "put the red cube into the plastic cup",
-        "reset_position_deg": [53.44, -11.69, -54.41, -0.19, -35.42, -1.01],
+    "put-blue-bowl-in-second-drawer": {
+        "instruction": "put the blue bowl in the second drawer",
+        "reset_position_deg": COLLECTION_RESET_POSITION_DEG,
+        "max_steps": 650,
     },
-    "setting2": {
-        "instruction": "stack the blue cup on top of the red cup",
-        "reset_position_deg": [36.20, 12.34, -43.52, -3.35, -60.06, 7.61],
-    },
-    "setting2_legacy": {
-        "instruction": "stack the red cup on top of the green cup",
-        "reset_position_deg": [36.20, 12.34, -43.52, -3.35, -60.06, 7.61],
+    "erase-circle-from-whiteboard": {
+        "instruction": "erase the circle from the whiteboard",
+        "reset_position_deg": COLLECTION_RESET_POSITION_DEG,
+        "max_steps": 1950,
     },
 }
 
@@ -165,10 +180,19 @@ class KeyListener:
 class RealsenseCapture:
     """Captures RGB frames from a RealSense camera identified by serial number."""
 
-    def __init__(self, serial: str, width: int = 1920, height: int = 1080, fps: int = 30):
+    def __init__(
+        self,
+        serial: str,
+        width: int = TRAIN_CAMERA_WIDTH,
+        height: int = TRAIN_CAMERA_HEIGHT,
+        fps: int = TRAIN_CAMERA_FPS,
+        warmup_frames: int = 30,
+    ):
         self.serial = serial
         self.width = width
         self.height = height
+        self._lock = threading.Lock()
+        self._closed = False
         self.pipeline = rs.pipeline()
 
         config = rs.config()
@@ -176,25 +200,188 @@ class RealsenseCapture:
         config.enable_stream(rs.stream.color, width, height, rs.format.yuyv, fps)
         self.pipeline.start(config)
 
-        for _ in range(30):
+        for _ in range(warmup_frames):
             self.pipeline.wait_for_frames()
-        print(f"Camera {serial} ready ({width}x{height} YUYV)")
-
-    def get_frame(self) -> np.ndarray:
-        frames = self.pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        if not color_frame:
-            raise RuntimeError(f"No color frame from camera {self.serial}")
-
-        raw = np.asanyarray(color_frame.get_data())
-        return cv2.cvtColor(
-            raw.view(np.uint8).reshape(self.height, self.width, 2),
-            cv2.COLOR_YUV2RGB_YUYV,
+        print(
+            f"Camera {serial} ready "
+            f"({width}x{height} YUYV @ {fps} FPS, warmup={warmup_frames})"
         )
 
+    def get_frame(self) -> np.ndarray:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError(f"RealSense {self.serial} is closed")
+            frames = self.pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
+            if not color_frame:
+                raise RuntimeError(f"No color frame from camera {self.serial}")
+
+            raw = np.asanyarray(color_frame.get_data())
+            image = cv2.cvtColor(
+                raw.view(np.uint8).reshape(self.height, self.width, 2),
+                cv2.COLOR_YUV2RGB_YUYV,
+            )
+            return np.ascontiguousarray(image)
+
     def close(self) -> None:
-        self.pipeline.stop()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.pipeline.stop()
         print(f"Camera {self.serial} stopped")
+
+
+class InferenceVideoRecorder:
+    """Record both full-resolution RealSense streams into one run directory."""
+
+    def __init__(
+        self,
+        output_dir: str,
+        external_camera: RealsenseCapture,
+        wrist_camera: RealsenseCapture,
+        fps: float,
+        task: str,
+        instruction: str,
+        save_frames: bool = False,
+        frame_jpeg_quality: int = 95,
+    ):
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        task_name = task or "custom"
+        self.run_dir = Path(output_dir).expanduser() / task_name / f"{timestamp}_{os.getpid()}"
+        self.run_dir.mkdir(parents=True, exist_ok=False)
+        self.external_camera = external_camera
+        self.wrist_camera = wrist_camera
+        self.fps = fps
+        self.save_frames = save_frames
+        self.frame_jpeg_quality = frame_jpeg_quality
+        self._frame_interval = 1.0 / fps
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._stopped = False
+        self._frame_count = 0
+        self._started_at = None
+        self._error = None
+        self._capture_pool = ThreadPoolExecutor(max_workers=2)
+
+        self._frame_dirs = {}
+        if self.save_frames:
+            self._frame_dirs = {
+                "external": self.run_dir / "external_frames",
+                "wrist": self.run_dir / "wrist_frames",
+            }
+            for frame_dir in self._frame_dirs.values():
+                frame_dir.mkdir()
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        self._writers = {
+            "external": cv2.VideoWriter(
+                str(self.run_dir / "external.mp4"),
+                fourcc,
+                fps,
+                (external_camera.width, external_camera.height),
+            ),
+            "wrist": cv2.VideoWriter(
+                str(self.run_dir / "wrist.mp4"),
+                fourcc,
+                fps,
+                (wrist_camera.width, wrist_camera.height),
+            ),
+        }
+        failed = [name for name, writer in self._writers.items() if not writer.isOpened()]
+        if failed:
+            for writer in self._writers.values():
+                writer.release()
+            raise RuntimeError(f"Could not open MP4 writer(s) {failed} in {self.run_dir}")
+
+        (self.run_dir / "run_meta.json").write_text(
+            json.dumps(
+                {
+                    "task": task,
+                    "instruction": instruction,
+                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "fps": fps,
+                    "save_frames": save_frames,
+                    "frame_jpeg_quality": frame_jpeg_quality if save_frames else None,
+                    "frame_filename_pattern": "frame_%06d.jpg" if save_frames else None,
+                    "resolution": [external_camera.width, external_camera.height],
+                    "external_camera_serial": external_camera.serial,
+                    "wrist_camera_serial": wrist_camera.serial,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def start(self) -> None:
+        self._started_at = time.perf_counter()
+        self._thread = threading.Thread(target=self._record_loop, daemon=True)
+        self._thread.start()
+        print(
+            f"[VIDEO] Recording {self.external_camera.width}x{self.external_camera.height} "
+            f"at {self.fps:g} FPS to {self.run_dir}"
+        )
+        if self.save_frames:
+            print(
+                f"[VIDEO] Saving every recorded frame as JPEG "
+                f"(quality={self.frame_jpeg_quality})"
+            )
+
+    def _record_loop(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                started = time.perf_counter()
+                external_future = self._capture_pool.submit(self.external_camera.get_frame)
+                wrist_future = self._capture_pool.submit(self.wrist_camera.get_frame)
+                external_rgb = external_future.result()
+                wrist_rgb = wrist_future.result()
+                external_bgr = cv2.cvtColor(external_rgb, cv2.COLOR_RGB2BGR)
+                wrist_bgr = cv2.cvtColor(wrist_rgb, cv2.COLOR_RGB2BGR)
+                self._writers["external"].write(external_bgr)
+                self._writers["wrist"].write(wrist_bgr)
+                if self.save_frames:
+                    filename = f"frame_{self._frame_count:06d}.jpg"
+                    jpeg_params = [cv2.IMWRITE_JPEG_QUALITY, self.frame_jpeg_quality]
+                    external_ok = cv2.imwrite(
+                        str(self._frame_dirs["external"] / filename),
+                        external_bgr,
+                        jpeg_params,
+                    )
+                    wrist_ok = cv2.imwrite(
+                        str(self._frame_dirs["wrist"] / filename),
+                        wrist_bgr,
+                        jpeg_params,
+                    )
+                    if not external_ok or not wrist_ok:
+                        raise RuntimeError(f"Failed to save JPEG frame pair {filename}")
+                self._frame_count += 1
+                remaining = self._frame_interval - (time.perf_counter() - started)
+                self._stop_event.wait(max(remaining, 0.001))
+        except Exception as exc:
+            self._error = str(exc)
+            print(f"[VIDEO] Recording stopped after error: {exc}", flush=True)
+        finally:
+            for writer in self._writers.values():
+                writer.release()
+
+    def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        self._capture_pool.shutdown(wait=False)
+        elapsed = time.perf_counter() - self._started_at if self._started_at else 0.0
+        effective_fps = self._frame_count / elapsed if elapsed > 0 else 0.0
+        print(
+            f"[VIDEO] Saved {self._frame_count} frames per camera "
+            f"({effective_fps:.1f} effective FPS) to {self.run_dir}"
+        )
+        if self._error:
+            print(f"[VIDEO] WARNING: {self._error}")
 
 
 class OFTActionClient:
@@ -258,41 +445,27 @@ def get_xarm_state_cached(arm: XArmAPI, proprio_dim: int) -> np.ndarray:
 
 def crop_and_resize(
     image_rgb: np.ndarray,
-    crop_size: int = 1080,
-    target_size: int = 224,
-    crop_mode: str = "center",
+    crop_left: int,
+    crop_size: int = TRAIN_CROP_SIZE,
+    target_size: int = POLICY_IMAGE_SIZE,
 ) -> np.ndarray:
-    """Crop with numpy slicing, then resize with PIL LANCZOS."""
+    """Apply the exact RLDS square crop, then resize with PIL LANCZOS."""
+    if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
+        raise ValueError(f"Expected RGB image with shape (H,W,3), got {image_rgb.shape}")
     h, w = image_rgb.shape[:2]
+    if crop_size <= 0 or crop_left < 0 or crop_size > h or crop_left + crop_size > w:
+        raise ValueError(
+            f"Crop [x={crop_left}:{crop_left + crop_size}, y=0:{crop_size}] "
+            f"does not fit image {w}x{h}"
+        )
 
-    if crop_mode == "center":
-        left = (w - crop_size) // 2
-        cropped = image_rgb[0:crop_size, left:left + crop_size]
-    elif crop_mode == "right":
-        right = w - 80
-        left = right - crop_size
-        cropped = image_rgb[0:crop_size, left:right]
-    elif crop_mode == "right_0":
-        right = w
-        left = right - crop_size
-        cropped = image_rgb[0:crop_size, left:right]
-    elif crop_mode == "right_3/4":
-        left = w // 4
-        cropped = image_rgb[0:h, left:w]
-    elif crop_mode == "left_180":
-        left = 180
-        cropped = image_rgb[0:crop_size, left:left + crop_size]
-    elif crop_mode == "left_540":
-        left = 540
-        cropped = image_rgb[0:crop_size, left:left + crop_size]
-    elif crop_mode == "resize_only":
-        cropped = image_rgb
-    else:
-        raise ValueError(f"Invalid crop_mode: {crop_mode}")
+    cropped = image_rgb[0:crop_size, crop_left : crop_left + crop_size]
+    if cropped.shape != (crop_size, crop_size, 3):
+        raise RuntimeError(f"Unexpected cropped image shape: {cropped.shape}")
 
     pil_img = Image.fromarray(cropped)
     pil_resized = pil_img.resize((target_size, target_size), Image.LANCZOS)
-    return np.array(pil_resized)
+    return np.ascontiguousarray(pil_resized, dtype=np.uint8)
 
 
 def save_debug_image(path: Path, image: np.ndarray) -> None:
@@ -312,8 +485,9 @@ class AsyncInferenceWorker:
         overlap_k: int,
         num_open_loop_steps: int,
         proprio_dim: int,
-        wrist_crop: str,
-        external_crop: str,
+        wrist_crop_left: int,
+        external_crop_left: int,
+        crop_size: int,
         debug_image_dir: str,
         debug_image_every: int,
         log_action_chunks: bool,
@@ -326,8 +500,9 @@ class AsyncInferenceWorker:
         self.overlap_k = overlap_k
         self.num_open_loop_steps = num_open_loop_steps
         self.proprio_dim = proprio_dim
-        self.wrist_crop = wrist_crop
-        self.external_crop = external_crop
+        self.wrist_crop_left = wrist_crop_left
+        self.external_crop_left = external_crop_left
+        self.crop_size = crop_size
         self.debug_image_dir = Path(debug_image_dir).expanduser() if debug_image_dir else None
         self.debug_image_every = max(1, debug_image_every)
         self.log_action_chunks = log_action_chunks
@@ -355,11 +530,19 @@ class AsyncInferenceWorker:
 
     def _capture_wrist(self) -> tuple[np.ndarray, np.ndarray]:
         raw = self.cam_wrist.get_frame()
-        return raw, crop_and_resize(raw, crop_mode=self.wrist_crop)
+        return raw, crop_and_resize(
+            raw,
+            crop_left=self.wrist_crop_left,
+            crop_size=self.crop_size,
+        )
 
     def _capture_ext(self) -> tuple[np.ndarray, np.ndarray]:
         raw = self.cam_external.get_frame()
-        return raw, crop_and_resize(raw, crop_mode=self.external_crop)
+        return raw, crop_and_resize(
+            raw,
+            crop_left=self.external_crop_left,
+            crop_size=self.crop_size,
+        )
 
     def _save_debug_images(
         self,
@@ -379,12 +562,14 @@ class AsyncInferenceWorker:
         prefix = f"{seq:06d}_{timestamp}"
         save_debug_image(self.debug_image_dir / f"{prefix}_external_raw.jpg", raw_ext)
         save_debug_image(
-            self.debug_image_dir / f"{prefix}_external_{self.external_crop}_224.jpg",
+            self.debug_image_dir
+            / f"{prefix}_external_x{self.external_crop_left}_{POLICY_IMAGE_SIZE}.jpg",
             img_ext,
         )
         save_debug_image(self.debug_image_dir / f"{prefix}_wrist_raw.jpg", raw_wrist)
         save_debug_image(
-            self.debug_image_dir / f"{prefix}_wrist_{self.wrist_crop}_224.jpg",
+            self.debug_image_dir
+            / f"{prefix}_wrist_x{self.wrist_crop_left}_{POLICY_IMAGE_SIZE}.jpg",
             img_wrist,
         )
 
@@ -578,6 +763,59 @@ def init_gripper(arm: XArmAPI, open_pos: int, speed: int) -> float:
     return -1.0
 
 
+def startup_reset_to_home(
+    arm: XArmAPI,
+    reset_angles_deg: list[float],
+    *,
+    reset_speed: float,
+    reset_pause: float,
+    reset_timeout: float,
+    dry_run: bool,
+) -> np.ndarray:
+    """Reset before cameras and the first model query, matching PAIR startup."""
+    print("\n  [STARTUP RESET] Returning to the configured collection pose...")
+    if dry_run:
+        print(f"  [STARTUP RESET] dry-run: would move joints to {reset_angles_deg}")
+    else:
+        arm.clean_error()
+        arm.clean_warn()
+        arm.motion_enable(enable=True)
+        arm.set_mode(0)
+        arm.set_state(0)
+        time.sleep(0.5)
+        code = arm.set_servo_angle(
+            angle=reset_angles_deg,
+            speed=reset_speed,
+            is_radian=False,
+            wait=True,
+            timeout=reset_timeout,
+        )
+        if code != 0:
+            try:
+                err_warn = arm.get_err_warn_code()
+            except Exception:
+                err_warn = None
+            raise RuntimeError(
+                "automatic startup reset failed: "
+                f"code={code}, arm_error={arm.error_code}, arm_state={arm.state}, err_warn={err_warn}"
+            )
+        print(f"  [STARTUP RESET] Reached joint pose: {reset_angles_deg}")
+
+    if reset_pause > 0:
+        print(f"  [STARTUP RESET] Pausing {reset_pause:.1f}s...")
+        time.sleep(reset_pause)
+
+    code, pose = arm.get_position(is_radian=True)
+    if code != 0 or pose is None or len(pose) < 6:
+        raise RuntimeError(f"get_position failed after automatic startup reset: code={code}")
+    tracked_pose = np.asarray(pose[:6], dtype=np.float64)
+    print(
+        "  [STARTUP RESET] Complete. TCP: "
+        f"[{', '.join(f'{value:.2f}' for value in tracked_pose)}]\n"
+    )
+    return tracked_pose
+
+
 def flush_action_queue(worker: AsyncInferenceWorker) -> int:
     with worker._lock:
         stale = len(worker._queue)
@@ -722,10 +960,15 @@ def parse_args():
         default=None,
         help="Raw task instruction. Do not include the OpenVLA 'In: ... Out:' wrapper.",
     )
-    parser.add_argument("--max-steps", type=int, default=30000)
-    parser.add_argument("--action-hz", type=float, default=25.0)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Safety cap in 10 Hz policy steps; defaults to the selected task preset.",
+    )
+    parser.add_argument("--action-hz", type=float, default=10.0)
     parser.add_argument("--servo-hz", type=float, default=100.0)
-    parser.add_argument("--num-open-loop-steps", type=int, default=25)
+    parser.add_argument("--num-open-loop-steps", type=int, default=8)
     parser.add_argument("--async-requery", action="store_true", help="Use legacy overlap/blending requery")
     parser.add_argument("--overlap-k", type=int, default=5)
 
@@ -737,11 +980,23 @@ def parse_args():
     parser.add_argument("--proprio-dim", type=int, default=6, help="xArm OFT proprio dimension; use 6 or legacy padded 8")
     parser.add_argument("--external-cam-serial", default=DEFAULT_EXTERNAL_CAM_SERIAL)
     parser.add_argument("--wrist-cam-serial", default=DEFAULT_WRIST_CAM_SERIAL)
-    parser.add_argument("--camera-width", type=int, default=1920)
-    parser.add_argument("--camera-height", type=int, default=1080)
-    parser.add_argument("--camera-fps", type=int, default=30)
-    parser.add_argument("--external-crop", default="left_540")
-    parser.add_argument("--wrist-crop", default="right")
+    parser.add_argument("--camera-width", type=int, default=TRAIN_CAMERA_WIDTH)
+    parser.add_argument("--camera-height", type=int, default=TRAIN_CAMERA_HEIGHT)
+    parser.add_argument("--camera-fps", type=int, default=TRAIN_CAMERA_FPS)
+    parser.add_argument("--camera-warmup-frames", type=int, default=30)
+    parser.add_argument(
+        "--external-crop-left",
+        type=int,
+        default=TRAIN_EXTERNAL_CROP_LEFT,
+        help="External cam_1 square-crop left edge; training used x=270.",
+    )
+    parser.add_argument(
+        "--wrist-crop-left",
+        type=int,
+        default=TRAIN_WRIST_CROP_LEFT,
+        help="Wrist cam_0 square-crop left edge; training used x=380.",
+    )
+    parser.add_argument("--crop-size", type=int, default=TRAIN_CROP_SIZE)
     parser.add_argument(
         "--debug-image-dir",
         default="",
@@ -753,6 +1008,15 @@ def parse_args():
         default=1,
         help="Save one image set every N inference requests when --debug-image-dir is set.",
     )
+    parser.add_argument("--record-video", action="store_true")
+    parser.add_argument("--video-dir", default="outputs/videos")
+    parser.add_argument("--video-fps", type=float, default=30.0)
+    parser.add_argument(
+        "--save-video-frames",
+        action="store_true",
+        help="Save every recorded external/wrist video frame as an aligned JPEG pair.",
+    )
+    parser.add_argument("--frame-jpeg-quality", type=int, default=95)
 
     parser.add_argument("--speed-scale", type=float, default=1.0)
     parser.add_argument("--max-delta-mm", type=float, default=200.0)
@@ -813,8 +1077,60 @@ def main() -> None:
         if preset is None:
             raise ValueError("--reset-position-deg is required when --task custom")
         args.reset_position_deg = list(preset["reset_position_deg"])
+    if args.max_steps is None:
+        args.max_steps = int(preset["max_steps"]) if preset is not None else 30000
     args.prompt = normalize_prompt(args.prompt)
     warn_if_full_openvla_prompt(args.prompt)
+
+    if args.max_steps <= 0:
+        raise ValueError(f"--max-steps must be positive, got {args.max_steps}")
+    if args.action_hz <= 0 or args.servo_hz < args.action_hz:
+        raise ValueError("Require 0 < action_hz <= servo_hz")
+    if args.camera_width <= 0 or args.camera_height <= 0 or args.camera_fps <= 0:
+        raise ValueError("Camera width, height, and FPS must be positive")
+    if args.camera_warmup_frames < 0:
+        raise ValueError("--camera-warmup-frames must be non-negative")
+    if args.crop_size <= 0:
+        raise ValueError("--crop-size must be positive")
+    if args.record_video:
+        if args.video_fps <= 0 or args.video_fps > args.camera_fps:
+            raise ValueError("Require 0 < video_fps <= camera_fps")
+        if not args.video_dir.strip():
+            raise ValueError("--video-dir cannot be empty when recording video")
+        if not 1 <= args.frame_jpeg_quality <= 100:
+            raise ValueError("--frame-jpeg-quality must be in [1,100]")
+    elif args.save_video_frames:
+        raise ValueError("--save-video-frames requires --record-video")
+
+    if preset is not None:
+        actual_geometry = (
+            args.camera_width,
+            args.camera_height,
+            args.camera_fps,
+            args.crop_size,
+            args.external_crop_left,
+            args.wrist_crop_left,
+        )
+        training_geometry = (
+            TRAIN_CAMERA_WIDTH,
+            TRAIN_CAMERA_HEIGHT,
+            TRAIN_CAMERA_FPS,
+            TRAIN_CROP_SIZE,
+            TRAIN_EXTERNAL_CROP_LEFT,
+            TRAIN_WRIST_CROP_LEFT,
+        )
+        if actual_geometry != training_geometry:
+            raise ValueError(
+                "New UF850 tasks require the exact training camera geometry "
+                f"(width,height,fps,crop_size,external_left,wrist_left)={training_geometry}; "
+                f"got {actual_geometry}"
+            )
+
+    # Validate both crops before opening hardware. This catches negative or
+    # truncated numpy slices instead of silently resizing the wrong view.
+    geometry_probe = np.zeros((args.camera_height, args.camera_width, 3), dtype=np.uint8)
+    crop_and_resize(geometry_probe, args.external_crop_left, args.crop_size)
+    crop_and_resize(geometry_probe, args.wrist_crop_left, args.crop_size)
 
     substeps = max(1, round(args.servo_hz / args.action_hz))
     servo_dt = 1.0 / args.servo_hz
@@ -838,6 +1154,7 @@ def main() -> None:
     cam_external = None
     cam_wrist = None
     worker = None
+    video_recorder = None
     key_listener = None
 
     def cleanup(signum=None, frame=None):
@@ -852,6 +1169,11 @@ def main() -> None:
                 worker.shutdown()
             except Exception:
                 pass
+        if video_recorder is not None:
+            try:
+                video_recorder.stop()
+            except Exception as exc:
+                print(f"Video cleanup error: {exc}")
         if arm is not None:
             try:
                 arm.set_mode(0)
@@ -883,6 +1205,16 @@ def main() -> None:
         print(f"Task preset: {args.task}")
         print(f"Task instruction: {args.prompt!r}")
         print(f"Reset pose (deg): {args.reset_position_deg}")
+        print(f"Video recording: {args.record_video}")
+        print(
+            "Training camera geometry: "
+            f"{args.camera_width}x{args.camera_height} @ {args.camera_fps} FPS; "
+            f"external=[{args.external_crop_left},0,"
+            f"{args.external_crop_left + args.crop_size},{args.crop_size}], "
+            f"wrist=[{args.wrist_crop_left},0,"
+            f"{args.wrist_crop_left + args.crop_size},{args.crop_size}] -> "
+            f"{POLICY_IMAGE_SIZE}x{POLICY_IMAGE_SIZE}"
+        )
         print(f"Connecting to OFT server at {endpoint}...")
         client = OFTActionClient(endpoint=endpoint, timeout=args.request_timeout)
 
@@ -915,11 +1247,14 @@ def main() -> None:
 
         print("xArm initialized")
 
-        code, init_pose = arm.get_position(is_radian=True)
-        if code != 0:
-            raise RuntimeError(f"Initial get_position failed: code={code}")
-        tracked_pose = np.array(init_pose[:6], dtype=np.float64)
-        print(f"  Initial TCP pose: [{', '.join(f'{v:.2f}' for v in tracked_pose)}]")
+        tracked_pose = startup_reset_to_home(
+            arm,
+            list(args.reset_position_deg),
+            reset_speed=args.reset_speed,
+            reset_pause=args.reset_pause,
+            reset_timeout=args.reset_timeout,
+            dry_run=args.dry_run,
+        )
 
         print("Starting cameras...")
         cam_external = RealsenseCapture(
@@ -927,13 +1262,28 @@ def main() -> None:
             width=args.camera_width,
             height=args.camera_height,
             fps=args.camera_fps,
+            warmup_frames=args.camera_warmup_frames,
         )
         cam_wrist = RealsenseCapture(
             args.wrist_cam_serial,
             width=args.camera_width,
             height=args.camera_height,
             fps=args.camera_fps,
+            warmup_frames=args.camera_warmup_frames,
         )
+
+        if args.record_video:
+            video_recorder = InferenceVideoRecorder(
+                args.video_dir,
+                cam_external,
+                cam_wrist,
+                args.video_fps,
+                args.task,
+                args.prompt,
+                save_frames=args.save_video_frames,
+                frame_jpeg_quality=args.frame_jpeg_quality,
+            )
+            video_recorder.start()
 
         worker = AsyncInferenceWorker(
             client=client,
@@ -944,8 +1294,9 @@ def main() -> None:
             overlap_k=args.overlap_k,
             num_open_loop_steps=args.num_open_loop_steps,
             proprio_dim=args.proprio_dim,
-            wrist_crop=args.wrist_crop,
-            external_crop=args.external_crop,
+            wrist_crop_left=args.wrist_crop_left,
+            external_crop_left=args.external_crop_left,
+            crop_size=args.crop_size,
             debug_image_dir=args.debug_image_dir,
             debug_image_every=args.debug_image_every,
             log_action_chunks=args.log_action_chunks,
